@@ -439,8 +439,14 @@ def _drain_rpc_service(config):
     rpc_config = dict(config.get("rpc") or {})
     max_items = int(rpc_config.get("drain_max_items", 20))
     processed = 0
-    if hasattr(_rpc_service, "drain_request_queue"):
-        processed += _rpc_service.drain_request_queue(max_items=max_items)
+    # [BUG-20260811-dual-consumer] background_threads=True (redis) 时后台 brpop 线程已
+    # 消费请求队列, 主循环 drain 再 lpop = 双消费者抢同一 Redis list → 请求被两边处理 /
+    # 响应竞争 (08-10 True 实测 8 分钟回退即此根因, 当时误记为"线程被 QMT 沙箱冻结" —
+    # 实测线程活, source=pubsub 在处理请求). True 时跳过主循环 drain_request_queue,
+    # 只做 drain_pending (线程不覆盖的路径) + reap_expired. False 时维持主循环 lpop drain.
+    if not getattr(_rpc_service, "background_threads", False):
+        if hasattr(_rpc_service, "drain_request_queue"):
+            processed += _rpc_service.drain_request_queue(max_items=max_items)
     processed += _rpc_service.drain_pending(max_items=max_items)
     if _quote_subscription_service is not None:
         try:

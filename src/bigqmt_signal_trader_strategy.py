@@ -75,6 +75,11 @@ _LATENCY_PROBE_THRESHOLD_MS = 50.0
 _latency_probe_started = False
 _last_full_tick_refresh_at = 0.0
 _last_full_tick_market_refresh_at = 0.0
+# [quote_events] single-stock subscribe_quote push pump state (upstream 的 publisher
+# 管 whole_quote; 这套管 subscribe_quote). _last_quote_push_at=throttle; _last_quote_bar_time
+# [seq]=last pushed close (dedup, 推送仅在价格变动时触发).
+_last_quote_push_at = 0.0
+_last_quote_bar_time = {}
 # Observed adjust cadence, so a mis-scheduled run_time (e.g. clamped to bar
 # cadence) is visible in the logs instead of silently costing latency.
 _adjust_tick_stats = {"last_ts": 0.0, "count": 0, "window_start": 0.0, "sum": 0.0, "min": 0.0, "max": 0.0}
@@ -675,6 +680,127 @@ def _diag_startup(ContextInfo, config):
     print("=" * 60)
 
 
+def _push_quote_updates(context_info, config):
+    """[quote_events] single-stock subscribe_quote 实时推送 pump.
+
+    upstream 的 whole_quote publisher 管 subscribe_whole_quote (ContextInfo native 回调);
+    这套管 subscribe_quote (backend gateway_provider 用) — adjust 每 ~1s 读订阅 hash →
+    get_full_tick (QMT 本地无 RPC, 返实时 lastPrice) → dedup 按 close → publish 到
+    bigqmt:quote_events:{account_id}. backend _quote_event_loop 按 seq 路由回 callback.
+
+    get_full_tick vs get_market_data_ex: 后者 1m bar 需 download_history_data 预下载,
+    未下载/午休返空 → 0 推送 (BUG-20260811-bridge-quote 实测); get_full_tick 始终返实时
+    快照. lastPrice 比分钟 bar close 更新鲜. dedup 按 close = 价格变才推 (真·实时语义).
+    防御式: 任何失败记日志返回, 不崩 adjust (绝不拖垮 RPC drain 节奏).
+    """
+    global _last_quote_push_at
+    quote_config = dict(config.get("quote_events") or {})
+    if not _config_bool(quote_config.get("enabled"), True):
+        return 0
+    account_id = str(
+        quote_config.get("account_id")
+        or config.get("account_id")
+        or _account_id
+        or ""
+    )
+    if not account_id:
+        return 0
+    now = time.time()
+    interval = float(quote_config.get("refresh_interval_seconds") or 1.0)
+    if now - _last_quote_push_at < interval:
+        return 0
+    _last_quote_push_at = now
+
+    redis_client = getattr(_rpc_service, "redis", None)
+    if redis_client is None:
+        redis_config = dict(config.get("redis") or {})
+        if not redis_config:
+            return 0
+        try:
+            from bigqmt_signal_trader.adapters.redis_common import build_redis_client
+
+            redis_client = build_redis_client(redis_config)
+        except Exception as exc:
+            print("[bigqmt_quote_events] build_redis_client failed: %s" % exc)
+            return 0
+
+    try:
+        sub_key = "bigqmt:quote_subscriptions:%s" % account_id
+        raw_subs = redis_client.hgetall(sub_key) or {}
+    except Exception as exc:
+        print("[bigqmt_quote_events] hgetall failed: %s" % exc)
+        return 0
+    if not raw_subs:
+        return 0
+
+    import json as _json
+    from bigqmt_signal_trader import quote_events
+
+    all_subs = []  # (seq, code)
+    for seq_str, payload_raw in raw_subs.items():
+        try:
+            payload = (
+                _json.loads(payload_raw)
+                if isinstance(payload_raw, (str, bytes, bytearray))
+                else payload_raw
+            )
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("active") is False:
+                continue
+            stock_code = payload.get("stock_code")
+            if not stock_code:
+                continue
+            all_subs.append((payload.get("seq") or seq_str, stock_code))
+        except Exception:
+            continue
+    if not all_subs:
+        return 0
+
+    try:
+        tick_data = context_info.get_full_tick([c for _, c in all_subs]) or {}
+    except Exception as exc:
+        print("[bigqmt_quote_events] get_full_tick failed: %s" % exc)
+        return 0
+    if not isinstance(tick_data, dict):
+        return 0
+
+    pushed = 0
+    for seq_val, stock_code in all_subs:
+        try:
+            cell = tick_data.get(stock_code)
+            if not isinstance(cell, dict):
+                continue
+            close = cell.get("lastPrice") or cell.get("close")
+            try:
+                close_v = float(close or 0)
+            except (TypeError, ValueError):
+                continue
+            if close_v <= 0:
+                continue
+            bar_time = "tick_%.4f" % close_v
+            if bar_time == _last_quote_bar_time.get(str(seq_val)):
+                continue
+            row = {
+                "open": cell.get("open"),
+                "high": cell.get("high"),
+                "low": cell.get("low"),
+                "close": close,
+                "volume": cell.get("volume"),
+                "amount": cell.get("amount"),
+            }
+            event = quote_events.normalize_quote_event(
+                seq=seq_val, stock_code=stock_code, period="1m",
+                bar=row, account_id=account_id,
+            )
+            quote_events.publish_quote_event(redis_client, account_id, event)
+            _last_quote_bar_time[str(seq_val)] = bar_time
+            pushed += 1
+        except Exception as exc:
+            print("[bigqmt_quote_events] seq=%s push failed: %s" % (seq_val, exc))
+    return pushed
+
+
 def _pump_download_jobs(context_info, config):
     """Advance any queued async download job by a bounded slice on this thread."""
     job_config = dict(config.get("download_jobs") or {})
@@ -731,6 +857,7 @@ def adjust(ContextInfo):
     config = _build_config()
     _adjust_phase("drain", _drain_rpc_service, config)
     _adjust_phase("full_tick", _refresh_full_tick_cache, ContextInfo, config)
+    _adjust_phase("quote_push", _push_quote_updates, ContextInfo, config)
     _adjust_phase("download", _pump_download_jobs, ContextInfo, config)
     if hasattr(ContextInfo, "is_last_bar") and not ContextInfo.is_last_bar():
         return None

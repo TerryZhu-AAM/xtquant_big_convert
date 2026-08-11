@@ -577,6 +577,12 @@ class BigQmtXtData:
         self._cache_obj = None
         self._quote_session = None          # lazily built WholeQuoteClientSession
         self._quote_session_factory = None  # test hook: returns a session-like object
+        # [quote_events] seq -> callback for single-stock subscribe_quote real-time
+        # push dispatch (whole_quote 用 upstream 的 _quote_session; subscribe_quote 走
+        # 这套 — upstream 只修了 whole_quote 没修 subscribe_quote, backend 用后者).
+        self._quote_callbacks = {}
+        self._quote_event_thread = None
+        self._quote_event_running = False
 
     def _next_seq(self):
         self._subscribe_seq += 1
@@ -796,8 +802,31 @@ class BigQmtXtData:
             "count": count,
         }
         self.client.save_quote_subscription(seq, payload, active=True)
+        # [quote_events] 清同 code 旧 seq — 防订阅 hash 无限堆积 (每次重订阅新建 seq
+        # 不清旧, 实测 498 条/15 code). pump 全量取会放大 Redis 写. hlen>50 才清摊销成本.
+        try:
+            _redis = self.client._redis()
+            _sub_key = "bigqmt:quote_subscriptions:%s" % (self.client.account_id or "")
+            if _redis.hlen(_sub_key) > 50:
+                _stale = []
+                for _k, _v in _redis.hgetall(_sub_key).items():
+                    try:
+                        _p = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
+                        if _p.get("stock_code") == stock_code and str(_p.get("seq")) != str(seq):
+                            _stale.append(_k)
+                    except Exception:
+                        pass
+                if _stale:
+                    _redis.hdel(_sub_key, *_stale)
+        except Exception:
+            pass
         self.client.publish_event("subscribe_quote", payload)
         if callback is not None:
+            # [quote_events] register callback for real-time push dispatch. upstream
+            # 的 _quote_session 只管 whole_quote; subscribe_quote 走这套. QMT 端 adjust
+            # pump 读 hash → get_full_tick → publish → 这里按 seq 路由回 callback.
+            self._quote_callbacks[seq] = callback
+            self._start_quote_listener()
             try:
                 if str(period).lower() in ("tick", "full_tick"):
                     callback(self.get_full_tick([stock_code]))
@@ -885,7 +914,77 @@ class BigQmtXtData:
             payload = {"seq": seq}
             self.client.save_quote_subscription(seq, payload, active=False)
             self.client.publish_event("unsubscribe_quote", payload)
+        # [quote_events] drop single-stock subscribe_quote dispatch mapping.
+        self._quote_callbacks.pop(seq, None)
         return 0
+
+    # [quote_events] single-stock subscribe_quote real-time push listener
+    # (upstream 的 _quote_session 只管 whole_quote; backend 用 subscribe_quote 走这套).
+    def _start_quote_listener(self):
+        if self._quote_event_thread is not None and self._quote_event_thread.is_alive():
+            return
+        self._quote_event_running = True
+        self._quote_event_thread = threading.Thread(
+            target=self._quote_event_loop, name="bigqmt-quote-events", daemon=True
+        )
+        self._quote_event_thread.start()
+
+    def _quote_event_loop(self):
+        from .quote_events import quote_channel
+
+        while self._quote_event_running:
+            if not self._quote_callbacks:
+                time.sleep(0.5)
+                continue
+            account_id = str(self.client.account_id or "")
+            pubsub = None
+            try:
+                pubsub = self.client._redis().pubsub(ignore_subscribe_messages=True)
+                pubsub.subscribe(quote_channel(account_id))
+                while self._quote_event_running and self._quote_callbacks:
+                    if str(self.client.account_id or "") != account_id:
+                        break
+                    message = pubsub.get_message(timeout=1.0)
+                    if not message or message.get("type") != "message":
+                        continue
+                    self._dispatch_quote_event(message.get("data"))
+            except Exception:
+                time.sleep(1.0)
+            finally:
+                try:
+                    if pubsub is not None:
+                        pubsub.close()
+                except Exception:
+                    pass
+
+    def _dispatch_quote_event(self, raw):
+        try:
+            text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+            event = json.loads(text)
+        except Exception:
+            return
+        if not isinstance(event, dict) or event.get("event_type") != "quote":
+            return
+        seq = event.get("seq")
+        callback = self._quote_callbacks.get(seq)
+        if callback is None:
+            return
+        stock_code = str(event.get("stock_code") or "")
+        if not stock_code:
+            return
+        bar = {
+            "open": event.get("open"),
+            "high": event.get("high"),
+            "low": event.get("low"),
+            "close": event.get("close"),
+            "volume": event.get("volume"),
+            "amount": event.get("amount"),
+            "time": event.get("bar_time") or "",
+        }
+        try:
+            callback({stock_code: [bar]})
+        except Exception:
+            pass
 
     def run(self):
         while True:

@@ -1158,7 +1158,17 @@ class RedisPubSubRpcService:
                     "%s draining method=%s pending_after=%s"
                     % (self.print_prefix, request.get("method"), self.pending.qsize())
                 )
-            self.process_request(request)
+            # [BUG-P1-20260810-transport-deadlock] 单请求异常兜底: 旧实现 process_request
+            # 异常 (e.g. publish 失败 raise) 中断整次 drain, 该请求已出队 → 静默丢失 →
+            # 客户端持续 timeout. try/except 记日志继续.
+            try:
+                self.process_request(request)
+            except Exception as exc:
+                print(
+                    "%s drain item failed method=%s err=%s: %s"
+                    % (self.print_prefix, request.get("method"),
+                       exc.__class__.__name__, exc)
+                )
             processed += 1
         return processed
 
@@ -1210,7 +1220,18 @@ class RedisPubSubRpcService:
                 response["server_error"] = str(server_error)
         except Exception as exc:
             response["error"] = "%s: %s" % (exc.__class__.__name__, exc)
-        self._publish_response(request, response)
+        # [BUG-P1-20260810-transport-deadlock] _publish_response 兜底: 旧实现发布失败
+        # (send_response 全客户端失败 raise) 逃逸给 drain 调用方 → 中断整次 drain + 该
+        # 请求静默丢失. 发布失败记入 response.error, 不 raise.
+        try:
+            self._publish_response(request, response)
+        except Exception as exc:
+            response["error"] = "publish_failed: %s: %s" % (exc.__class__.__name__, exc)
+            print(
+                "%s publish_response failed method=%s err=%s: %s"
+                % (self.print_prefix, request.get("method"),
+                   exc.__class__.__name__, exc)
+            )
         self._processed_count += 1
         if self._processed_count <= self.debug_log_limit:
             print("%s responded method=%s ok=%s" % (self.print_prefix, method, response["ok"]))

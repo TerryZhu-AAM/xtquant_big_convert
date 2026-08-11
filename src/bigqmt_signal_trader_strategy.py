@@ -332,7 +332,11 @@ def _build_rpc_service(context_info, app, config):
         redis_config = dict(config.get("redis") or {})
         redis_config.update(dict(rpc_config.get("redis") or {}))
         listen_redis_config = dict(redis_config)
-        listen_redis_config["socket_timeout"] = None
+        # [BUG-P1-20260810-transport-deadlock] 不覆盖 socket_timeout=None. 旧实现让
+        # listen_redis 的 brpop/lpop/pubsub/llen 可无限阻塞且不抛异常 → 后台线程卡死无
+        # catch/自愈 (QMT 沙箱冻结线程后 "RPC timeout 但 adjust cadence 仍跑" 死锁).
+        # brpop/lpop 自带阻塞参数 (timeout=1), 继承 redis_common 默认 1.5s, 阻塞抛异常
+        # → 线程 catch 兜底.
         redis_client = rpc_config.get("redis_client") or config.get("redis_client") or _redis_common.build_redis_client(listen_redis_config)
         response_redis_client = (
             rpc_config.get("response_redis_client")

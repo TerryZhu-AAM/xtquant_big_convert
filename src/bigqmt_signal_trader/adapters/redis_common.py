@@ -31,7 +31,15 @@ def build_redis_client(config=None):
 
     host = config.get("host") or os.environ.get("BIGQMT_REDIS_HOST") or "127.0.0.1"
     port = int(config.get("port") or os.environ.get("BIGQMT_REDIS_PORT") or 6379)
-    db = int(config.get("db") or os.environ.get("BIGQMT_REDIS_DB") or 5)
+    # [BUG-P0-20260810-redis-db-mismatch] 禁 `config.get("db") or ...`: db=0 是合法选择
+    # (falsy 会被 `or` 短路吞掉回退默认 5), QMT 端 transport 与 backend 客户端因此连到
+    # 不同 DB, RPC 请求无人消费.
+    _db_value = config.get("db")
+    if _db_value is None or str(_db_value).strip() == "":
+        _db_value = os.environ.get("BIGQMT_REDIS_DB")
+    if _db_value is None or str(_db_value).strip() == "":
+        _db_value = 5
+    db = int(_db_value)
     username = config.get("username") or os.environ.get("BIGQMT_REDIS_USERNAME") or None
     password = config.get("password") or os.environ.get("BIGQMT_REDIS_PASSWORD") or None
     return redis.Redis(

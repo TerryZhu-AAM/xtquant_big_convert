@@ -309,7 +309,15 @@ class RedisTransport(RpcTransport):
             if not item:
                 break
             if self.on_raw_payload is not None:
-                self.on_raw_payload(item, "queue-drain")
+                # [BUG-P1-20260810-transport-deadlock] 单 item 异常兜底: 旧实现异常中断
+                # 整次 drain, 已 lpop 的 item 静默丢失 → 持续 timeout.
+                try:
+                    self.on_raw_payload(item, "queue-drain")
+                except Exception as exc:
+                    print(
+                        "%s drain item failed err=%s: %s"
+                        % (self.print_prefix, exc.__class__.__name__, exc)
+                    )
             else:
                 self.deliver(_loads(item))
             processed += 1

@@ -1886,9 +1886,15 @@ class BigQmtXtTrader:
         order_volume,
         price_type,
         price,
-        strategy_name,
-        order_remark,
+        strategy_name="",
+        order_remark="",
     ):
+        # [BUG-P0-20260811-bridge-order-stock-signature] strategy_name / order_remark
+        # 必须有 default '' (与 miniQMT 原生 XtQuantTrader.order_stock 对齐). 此前桥接
+        # 8 位置参无 default, 生产 caller (qmt_gateway.py / etf_live_broker.py) 只传
+        # 6 位置 + strategy_name= keyword → 切桥接后 silent TypeError → 被 oms_signals
+        # broad except 吞 → 全部 buy/sell rejected 但不崩进程不触发风控 (最阴 silent fail).
+        # 加 default 让 miniQMT 时代 caller 0 改动继续工作.
         data = self.order_stock_result(
             account, stock_code, order_type, order_volume, price_type,
             price, strategy_name, order_remark,
@@ -1897,7 +1903,7 @@ class BigQmtXtTrader:
 
     def order_stock_result(
         self, account, stock_code, order_type, order_volume, price_type,
-        price, strategy_name, order_remark,
+        price, strategy_name="", order_remark="",
     ):
         account_id = _account_id(account, self.client.account_id)
         return self.client.call(

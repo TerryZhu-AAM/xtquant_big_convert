@@ -17,6 +17,15 @@ from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .redis_rpc import call_redis_rpc
 
+# [BUG-20260811-rpc-storm] RPC 并发限流 — QMT 端 transport 单线程 drain (QMT 沙箱禁
+# 后台线程, rpc_background_threads=False 是 B 机钦定), backend 并发 RPC 风暴涌入 Redis
+# 队列 → 单请求慢/挂起堵死 QMT 主循环 (2026-08-11 实测 14:30 卡 7.6min / 14:43 卡 13min,
+# 根因均为 backend RPC 洪峰). 限流: 同时最多 BIGQMT_RPC_CONCURRENCY (默认 3) 个 RPC
+# 在途, 多余排队等 slot — QMT 队列永远 ≤ N 个堆积, 单请求挂起时只有 N 个受影响.
+# FormulaServer fast path (直连 58600, 不经 QMT 主循环 drain) 不限流.
+_RPC_CONCURRENCY = int(os.environ.get("BIGQMT_RPC_CONCURRENCY", "3") or 3)
+_RPC_INFLIGHT = threading.Semaphore(max(1, _RPC_CONCURRENCY))
+
 
 # Default OHLCV fields pulled + cached by download_history_data*.
 DEFAULT_DOWNLOAD_FIELDS = ["open", "high", "low", "close", "volume", "amount"]
@@ -507,27 +516,38 @@ class BigQmtRpcClient:
                 return _restore_jsonable(router.call(method, params or {}))
             except Unroutable:
                 pass
-        transport = self._transport()
-        if transport is not None:
-            # Swappable transport path (zmq/mysql/...). Build the request
-            # envelope the same way call_redis_rpc does.
-            request = {
-                "schema_version": 1,
-                "request_id": uuid.uuid4().hex,
-                "account_id": target_account,
-                "method": method,
-                "params": params or {},
-                "ttl_seconds": 60,
-            }
-            response = transport.send_request(request, wait_seconds)
-        else:
-            response = call_redis_rpc(
-                self._redis(),
-                account_id=target_account,
-                method=method,
-                params=params or {},
-                timeout_seconds=wait_seconds,
+        # [BUG-20260811-rpc-storm] RPC 路径限流 — 防并发风暴涌入 QMT 单线程 drain.
+        # acquire 带超时 (wait_seconds*2): 拿不到 slot → TimeoutError (防无限排队 +
+        # 防主 loop 阻塞超 watchdog 阈值). FormulaServer fast path 已提前 return.
+        _acquire_timeout = max(1.0, float(wait_seconds or 30) * 2)
+        if not _RPC_INFLIGHT.acquire(timeout=_acquire_timeout):
+            raise TimeoutError(
+                "bigqmt rpc concurrency throttle: %s (in-flight=%d)" % (method, _RPC_CONCURRENCY)
             )
+        try:
+            transport = self._transport()
+            if transport is not None:
+                # Swappable transport path (zmq/mysql/...). Build the request
+                # envelope the same way call_redis_rpc does.
+                request = {
+                    "schema_version": 1,
+                    "request_id": uuid.uuid4().hex,
+                    "account_id": target_account,
+                    "method": method,
+                    "params": params or {},
+                    "ttl_seconds": 60,
+                }
+                response = transport.send_request(request, wait_seconds)
+            else:
+                response = call_redis_rpc(
+                    self._redis(),
+                    account_id=target_account,
+                    method=method,
+                    params=params or {},
+                    timeout_seconds=wait_seconds,
+                )
+        finally:
+            _RPC_INFLIGHT.release()
         if not response.get("ok"):
             raise RuntimeError(response.get("error") or "Big QMT RPC failed: %s" % method)
         return _restore_jsonable(response.get("data"))

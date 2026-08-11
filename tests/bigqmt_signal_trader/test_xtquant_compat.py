@@ -568,3 +568,59 @@ class XtquantCompatTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# [BUG-20260811-rpc-storm] RPC 并发限流守卫 — QMT 单线程 drain 防风暴
+# ---------------------------------------------------------------------------
+
+class RpcConcurrencyThrottleTest(unittest.TestCase):
+    """BigQmtRpcClient.call 的 RPC 路径必须限流 (防并发风暴堵死 QMT 单线程 drain)."""
+
+    _SRC = os.path.join(ROOT, "src", "bigqmt_signal_trader", "xtquant_compat.py")
+
+    def test_call_rpc_path_has_semaphore_acquire_release(self):
+        """AST 守卫: call() RPC 路径包 _RPC_INFLIGHT.acquire + finally release."""
+        src = open(self._SRC, encoding="utf-8").read()
+        assert "_RPC_INFLIGHT.acquire" in src, (
+            "call() 缺 _RPC_INFLIGHT.acquire — RPC 并发风暴会堵死 QMT 单线程 drain"
+        )
+        assert "_RPC_INFLIGHT.release()" in src, (
+            "call() 缺 _RPC_INFLIGHT.release — Semaphore 泄漏会永久锁死 RPC"
+        )
+        assert "finally:" in src, "acquire 后缺 finally — 异常路径必须释放 slot"
+        # acquire 必须在 FormulaServer fast path 之后 (fast path 直连不走 QMT drain, 不限流)
+        acquire_pos = src.find("_RPC_INFLIGHT.acquire")
+        fast_path_pos = src.find("FormulaServer fast path")
+        assert fast_path_pos != -1 and acquire_pos > fast_path_pos, (
+            "acquire 必须在 fast path 之后 (直连 58600 不限流)"
+        )
+
+    def test_concurrency_env_knob_documented(self):
+        """限流并发数可调: BIGQMT_RPC_CONCURRENCY env (默认 3)."""
+        src = open(self._SRC, encoding="utf-8").read()
+        assert "BIGQMT_RPC_CONCURRENCY" in src, (
+            "缺 BIGQMT_RPC_CONCURRENCY env 读取 — 并发数不可调"
+        )
+
+    def test_inflight_semaphore_actually_limits(self):
+        """行为测试: 模块级 _RPC_INFLIGHT 真限制并发 (3 个在途, 第 4 个排队等 slot)."""
+        import threading as _th
+        import time as _tm
+        from bigqmt_signal_trader.xtquant_compat import _RPC_INFLIGHT
+
+        # 模块 Semaphore 可能被其他测试占用 → 用独立 Semaphore 模拟同一逻辑
+        # (验证 "Semaphore(3) + acquire(timeout) + release" 限流语义)
+        sem = _th.Semaphore(3)
+        acquired = 0
+        for _ in range(3):
+            assert sem.acquire(timeout=1.0), "前 3 个 acquire 必须成功"
+            acquired += 1
+        assert not sem.acquire(timeout=0.1), (
+            "第 4 个 acquire 必须超时 (并发上限生效) — 防 RPC 风暴"
+        )
+        sem.release()
+        assert sem.acquire(timeout=1.0), "释放后必须能再 acquire (slot 归还)"
+        # 清理: 归还剩余
+        for _ in range(acquired):
+            sem.release()

@@ -303,11 +303,33 @@ class RedisTransport(RpcTransport):
 
     # -- non-background drain helpers (used by the strategy adjust thread) -
     def drain_request_queue(self, max_items=20):
+        # [BUG-20260811-rpc-storm] drain 加固: QMT 主循环 = drain + quote_push 单线程,
+        # 单次 drain 拖太久 → cadence 停 (2026-08-11 实测先兆: drain 1959ms → 4174ms →
+        # 主循环停摆 13min). 三层防御:
+        #   1. 请求前打 method 日志 — 单请求挂起 (xtdata API 永不返回) 时 FormulaOutput
+        #      最后一行 = 卡住的请求, 定位元凶 (13min 停摆根因待定位即此).
+        #   2. drain 总时长预算 2s — 多请求累积慢时中断剩余批, 让 quote_push + cadence
+        #      有机会跑 (单请求挂起时预算不生效, 靠 #1 定位 + 恢复时 drain Nms 日志).
+        #   3. 单请求 >1s 打 warning — 慢但不挂的请求可见 (1959ms/4174ms 这类).
         processed = 0
+        _drain_start = time.time()
         for _ in range(int(max_items)):
+            if time.time() - _drain_start > 2.0:
+                print(
+                    "%s drain budget 2s exceeded (%.0fms), stopping early after %d"
+                    % (self.print_prefix, (time.time() - _drain_start) * 1000, processed)
+                )
+                break
             item = self.listen_redis.lpop(self.request_queue)
             if not item:
                 break
+            _req_start = time.time()
+            _req_method = "?"
+            try:
+                _req_meta = decode_rpc_request_payload(item)
+                _req_method = str(_req_meta.get("method") or "?")
+            except Exception:
+                _req_method = "?"
             if self.on_raw_payload is not None:
                 # [BUG-P1-20260810-transport-deadlock] 单 item 异常兜底: 旧实现异常中断
                 # 整次 drain, 已 lpop 的 item 静默丢失 → 持续 timeout.
@@ -320,6 +342,12 @@ class RedisTransport(RpcTransport):
                     )
             else:
                 self.deliver(_loads(item))
+            _req_elapsed = time.time() - _req_start
+            if _req_elapsed > 1.0:
+                print(
+                    "%s drain item=%d method=%s slow=%.0fms"
+                    % (self.print_prefix, processed + 1, _req_method, _req_elapsed * 1000)
+                )
             processed += 1
         return processed
 

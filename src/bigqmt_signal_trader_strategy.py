@@ -799,6 +799,21 @@ def _push_quote_updates(context_info, config):
                 # time="" → ETFScalpStrategy.parse_tick_time fail-CLOSED raise → 每 tick
                 # 丢弃 → ETF 连上也不交易 (2026-08-11 实测 14:56 on_tick 连续异常).
                 "time": cell.get("time"),
+                # [BUG-P0-20260811-bridge-etf-tick-001] tick 快照字段透传 — ETF 战法
+                # on_tick 依赖 lastPrice (price, line 1028), bidPrice/askPrice (G6 微结构
+                # 打分 line 416-419), tickvol/bidVol/askVol (量能 + 不平衡打分 line 442/
+                # 459). get_full_tick cell 含这些字段 (QMT 本地完整 tick 快照); 旧 row 只
+                # 挑 6 OHLCV → ETF on_tick tick.get("lastPrice", 0.0)=0.0 → if price<=0:
+                # return → silent 永不交易 (与 §3.1 [A+B test live] 矛盾). close 已等于
+                # lastPrice 值 (line 780) 但字段名独立, 这里显式补 lastPrice 字段名 + 其它
+                # tick 字段. cell 缺字段 → None → ETF 战法走保守 fallback (不致命).
+                "lastPrice": cell.get("lastPrice") or close,
+                "lastClose": cell.get("lastClose"),
+                "bidPrice": cell.get("bidPrice"),
+                "askPrice": cell.get("askPrice"),
+                "bidVol": cell.get("bidVol"),
+                "askVol": cell.get("askVol"),
+                "tickvol": cell.get("tickvol"),
             }
             event = quote_events.normalize_quote_event(
                 seq=seq_val, stock_code=stock_code, period="1m",

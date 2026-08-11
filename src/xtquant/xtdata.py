@@ -29,6 +29,13 @@ def get_instrumentdetail(stock_code):
     return _compat.xtdata.get_instrumentdetail(stock_code)
 
 
+def get_instrument_detail_list(stock_list):
+    # [BUG-P1-20260811-bridge-instrument-detail-list-001] 显式 export (与 get_instrument_detail
+    # 同款), 让 hasattr(xtdata, 'get_instrument_detail_list') 返 True → gateway_provider
+    # 批量分支激活 (line 1252-1261), 不再走 fallback 逐票 RPC.
+    return _compat.xtdata.get_instrument_detail_list(stock_list)
+
+
 def get_instrument_type(stock_code, variety_list=None):
     return _compat.xtdata.get_instrument_type(stock_code, variety_list)
 

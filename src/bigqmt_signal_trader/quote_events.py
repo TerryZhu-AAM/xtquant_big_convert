@@ -36,7 +36,19 @@ EVENT_QUOTE = "quote"
 # what gateway_provider._handle_xt_tick already consumes (close/open/high/low/
 # volume/amount + stime/time), so the backend dispatches the payload straight
 # into the existing tick path without reshaping.
-_BAR_FIELDS = ("open", "high", "low", "close", "volume", "amount")
+#
+# [fix BUG-P0-20260811-bridge-etf-tick-001] tick snapshot fields extended for
+# ETF scalping strategy (ETFScalpStrategy.on_tick reads lastPrice as the primary
+# price, falls back to bidPrice/askPrice for G6 microstructure scoring, and reads
+# tickvol/bidVol/askVol for volume imbalance). Without these the 6 OHLCV-only bar
+# silently degrades ETF to price=0 early-return (永不交易). pullback_ma5 path B
+# (_handle_xt_tick) only reads close so the extra fields are inert there.
+_BAR_FIELDS = (
+    "open", "high", "low", "close", "volume", "amount",
+    "lastPrice", "lastClose",
+    "bidPrice", "askPrice", "bidVol", "askVol",
+    "tickvol",
+)
 
 
 def quote_channel(account_id):
@@ -85,6 +97,18 @@ def normalize_quote_event(seq, stock_code, period, bar, account_id=""):
         "close": fields["close"],
         "volume": fields["volume"],
         "amount": fields["amount"],
+        # [fix BUG-P0-20260811-bridge-etf-tick-001] tick snapshot passthrough — ETF
+        # 战法 on_tick 依赖 lastPrice (price), bidPrice/askPrice (G6 microstructure),
+        # tickvol/bidVol/askVol (volume imbalance). 桥接 pump 走 get_full_tick (QMT 本地
+        # 完整 tick 快照), cell 含这些字段; normalize 透传, 不裁剪. pullback_ma5 路径 B
+        # 只取 close, 多余字段 inert.
+        "lastPrice": fields["lastPrice"],
+        "lastClose": fields["lastClose"],
+        "bidPrice": fields["bidPrice"],
+        "askPrice": fields["askPrice"],
+        "bidVol": fields["bidVol"],
+        "askVol": fields["askVol"],
+        "tickvol": fields["tickvol"],
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }

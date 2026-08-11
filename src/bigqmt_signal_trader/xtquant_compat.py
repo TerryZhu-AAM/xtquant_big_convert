@@ -607,6 +607,10 @@ class BigQmtXtData:
         # push dispatch (whole_quote 用 upstream 的 _quote_session; subscribe_quote 走
         # 这套 — upstream 只修了 whole_quote 没修 subscribe_quote, backend 用后者).
         self._quote_callbacks = {}
+        # [BUG-P2-20260811-bridge-unsubscribe-quote-001] stock_code -> seq 反向索引.
+        # subscribe_quote 返回 seq 但 gateway_provider 不接 (调 subscribe_quote(code, ...,
+        # callback) 丢弃返回值), 后续 unsubscribe_quote(code, period=) 需要反查 seq.
+        self._code_to_seq = {}
         self._quote_event_thread = None
         self._quote_event_running = False
 
@@ -666,6 +670,52 @@ class BigQmtXtData:
 
     def get_instrumentdetail(self, stock_code):
         return self.get_instrument_detail(stock_code)
+
+    def get_instrument_detail_list(self, stock_list):
+        """批量 instrument_detail — gateway_provider.prefetch_instrument_details 期望 dict[code, detail].
+
+        QMT 端 RPC server 无原生批量方法 (formula_server 路由表只有 get_instrument_detail /
+        get_instrumentdetail 单票); 这里 backend 端并发调单票 get_instrument_detail 模拟批量.
+        并发度受 _RPC_INFLIGHT Semaphore (BIGQMT_RPC_CONCURRENCY, 默认 3) 限流, 与串行 N 次相比
+        加速 ~3x. 单票失败不阻塞其它 (try/except per call, 失败 code 不入 result).
+
+        修复 BUG-P1-20260811-bridge-instrument-detail-list-001: 切桥接后桥接 BigQmtXtData
+        无此方法 → gateway_provider.py:1249 hasattr 守卫返 False → 永远走 fallback 逐票 RPC
+        (批量分支 line 1252-1261 是死代码, fixture spec xtdata_stub.py:75 有此方法名但生产
+        从未激活). 本实现让 hasattr 返 True → 批量分支激活, 测试与生产对称.
+
+        Returns:
+            dict[code, detail], 缺失/失败 code 不含在 result 中.
+        """
+        codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
+        if not codes:
+            return {}
+
+        def _fetch_one(code):
+            try:
+                return code, self.get_instrument_detail(code)
+            except Exception:
+                return code, None
+
+        result = {}
+        # 并发度富裕 (max_workers=8) → Semaphore (_RPC_INFLIGHT) 自动限流到 BIGQMT_RPC_CONCURRENCY.
+        # 不读 env 是有意: Semaphore 是限流真理源, max_workers 富余不破坏限流不变量.
+        try:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(8, len(codes))) as pool:
+                for code, detail in pool.map(_fetch_one, codes):
+                    if detail:
+                        result[code] = detail
+        except Exception:
+            # 兜底: 并发框架异常 (OOM / 线程池满) → 串行降级, 永不崩.
+            for code in codes:
+                try:
+                    detail = self.get_instrument_detail(code)
+                    if detail:
+                        result[code] = detail
+                except Exception:
+                    continue
+        return result
 
     def get_instrument_type(self, stock_code, variety_list=None):
         return self._call("get_instrument_type", code=stock_code, variety_list=variety_list)
@@ -828,6 +878,10 @@ class BigQmtXtData:
             "count": count,
         }
         self.client.save_quote_subscription(seq, payload, active=True)
+        # [BUG-P2-20260811-bridge-unsubscribe-quote-001] 反向索引 stock_code -> seq,
+        # 无条件维护 (admin_subscribe 不传 callback 也写 Redis hash, admin_unsubscribe
+        # 需反查 seq 清 hash). 放 callback 块外覆盖所有 subscribe 调用路径.
+        self._code_to_seq[stock_code] = seq
         # [quote_events] 清同 code 旧 seq — 防订阅 hash 无限堆积 (每次重订阅新建 seq
         # 不清旧, 实测 498 条/15 code). pump 全量取会放大 Redis 写. hlen>50 才清摊销成本.
         try:
@@ -930,7 +984,33 @@ class BigQmtXtData:
                 pass
         return sub_id
 
-    def unsubscribe_quote(self, seq):
+    def unsubscribe_quote(self, seq_or_code, period=None):
+        """取消订阅. 兼容两种调用签名:
+
+        1. ``unsubscribe_quote(seq)`` — 原生 xtdata 协议 (seq = subscribe_quote 返回值, int).
+        2. ``unsubscribe_quote(code, period='1m')`` — gateway_provider 调用范式 (code-based,
+           反查 ``_code_to_seq`` 找 seq). ``period`` kwarg 接受但忽略 (订阅时已存 period).
+
+        修复 BUG-P2-20260811-bridge-unsubscribe-quote-001: 桥接原签名 ``unsubscribe_quote(seq)``
+        不接 ``period`` kwarg → gateway_provider 调 ``unsubscribe_quote(code, period='1m')`` 抛
+        ``TypeError: ... got an unexpected keyword argument 'period'`` 被 try/except 吞 →
+        silent no-op (订阅 hash 持续累积, 靠 subscribe_quote line 833-846 hash>50 自动清兜底).
+        miniQMT 原生 ``unsubscribe_quote(subscribe_id)`` 同样不接 period, 此 bug 在 miniQMT 时代
+        也存在 (非切桥接回归). 本修复让桥接兼容 gateway_provider 调用范式, 同时保留 seq 调用.
+        """
+        # code → seq 反查 (gateway_provider 调用范式)
+        if isinstance(seq_or_code, str):
+            seq = self._code_to_seq.pop(seq_or_code, None)
+            if seq is None:
+                # code 未订阅 / 已退订 → 静默 no-op (与 miniQMT 原生一致, 不抛错)
+                return 0
+        else:
+            seq = seq_or_code
+            # seq-based 退订时, 同步清反向索引 (避免 _code_to_seq 留 stale 映射)
+            for _code, _s in list(self._code_to_seq.items()):
+                if _s == seq:
+                    del self._code_to_seq[_code]
+                    break
         # subscribe_whole_quote handles are owned by the push session; single-stock
         # subscribe_quote seqs still retire through the legacy redis-event path.
         session = self._quote_session
@@ -1010,6 +1090,18 @@ class BigQmtXtData:
             # "%Y-%m-%d %H:%M:%S", pump ~1s cadence 精度, parse_tick_time ISO 格式兼容).
             # 禁后端 datetime.now() fallback (timezone-001 防跨日/跨时区漂移).
             "time": event.get("bar_time") or event.get("created_at") or "",
+            # [BUG-P0-20260811-bridge-etf-tick-001] tick snapshot 字段透传 — QMT 端
+            # _push_quote_updates row 已补这些字段 (quote_events._BAR_FIELDS 同步扩展),
+            # backend dispatch 时一并透传给 callback. ETF 战法 on_tick 依赖 lastPrice
+            # (price), bidPrice/askPrice (G6), tickvol/bidVol/askVol (量能). pullback_ma5
+            # 路径 B (_handle_xt_tick) 只取 close, 多余字段 inert.
+            "lastPrice": event.get("lastPrice") or event.get("close"),
+            "lastClose": event.get("lastClose"),
+            "bidPrice": event.get("bidPrice"),
+            "askPrice": event.get("askPrice"),
+            "bidVol": event.get("bidVol"),
+            "askVol": event.get("askVol"),
+            "tickvol": event.get("tickvol"),
         }
         try:
             callback({stock_code: [bar]})

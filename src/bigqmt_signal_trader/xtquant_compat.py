@@ -37,6 +37,12 @@ STOCK_SELL = 24
 FIX_PRICE = 11
 LATEST_PRICE = 5
 MARKET_PEER_PRICE_FIRST = 44
+# [BUG-20260811-xtconstant-001] 三档 SH 市价常量必须同步暴露 (upstream xtquant SDK 真值,
+# 迅投知识库附录 http://docs.thinktrader.net/pages/198696/ + 项目 test_qmt_gateway_status_map
+# _inject_fake_xtconstant 双源坐实). 此前只暴露 LIMIT (43), 缺 CANCEL (42) 导致 qmt_gateway
+# SH 票市价单 AttributeError (pullback_ma5 buy 默认 order_type='market' + emergency_liquidate
+# kill_switch 紧急清仓 market 全踩). 同步暴露 LIMIT + CANCEL 防漂移.
+MARKET_SH_CONVERT_5_CANCEL = 42
 MARKET_SH_CONVERT_5_LIMIT = 43
 MARKET_SZ_CONVERT_5_CANCEL = 47
 SZ_MARKET = 1

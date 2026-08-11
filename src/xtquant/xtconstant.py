@@ -2,6 +2,7 @@ from bigqmt_signal_trader.xtquant_compat import (
     FIX_PRICE,
     LATEST_PRICE,
     MARKET_PEER_PRICE_FIRST,
+    MARKET_SH_CONVERT_5_CANCEL,
     MARKET_SH_CONVERT_5_LIMIT,
     MARKET_SZ_CONVERT_5_CANCEL,
     ORDER_CANCELED,

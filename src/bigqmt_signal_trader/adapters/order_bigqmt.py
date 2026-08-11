@@ -15,6 +15,10 @@ PRICE_TYPE_ALIASES = {
     "FIX_PRICE": 11,
     "LATEST_PRICE": 5,
     "MARKET_PEER_PRICE_FIRST": 44,
+    # [BUG-20260811-xtconstant-001] SH 五档即成剩撤 (42) 必须暴露 — backend qmt_gateway
+    # 默认传 int (xtconstant.MARKET_SH_CONVERT_5_CANCEL) 不走此 dict, 但防御性补全
+    # 防 future string 调用路径漂移. 与 xtquant_compat 常量真值同步 (单一真理源).
+    "MARKET_SH_CONVERT_5_CANCEL": 42,
     "MARKET_SH_CONVERT_5_LIMIT": 43,
     "MARKET_SZ_CONVERT_5_CANCEL": 47,
 }

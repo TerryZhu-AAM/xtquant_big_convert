@@ -42,7 +42,9 @@ RPC 服务端会把以下 MiniQMT 常用方法名映射到大 QMT 适配器：
 
 `order_stock` 参数兼容 `stock_code`、`order_type`、`order_volume`、`price_type`、`price`、`strategy_name`、`order_remark`。其中 `order_type=23/STOCK_BUY` 映射为买入，`order_type=24/STOCK_SELL` 映射为卖出。
 
-`price_type` 会透传到大 QMT `passorder()`，常用值包括 `11/FIX_PRICE`、`5/LATEST_PRICE`、`44/MARKET_PEER_PRICE_FIRST`、`43/MARKET_SH_CONVERT_5_LIMIT`、`47/MARKET_SZ_CONVERT_5_CANCEL`。
+`price_type` 会透传到大 QMT `passorder()`，常用值包括 `11/FIX_PRICE`、`5/LATEST_PRICE`、`44/MARKET_PEER_PRICE_FIRST`、`42/MARKET_SH_CONVERT_5_CANCEL`、`43/MARKET_SH_CONVERT_5_LIMIT`、`47/MARKET_SZ_CONVERT_5_CANCEL`。
+
+> [BUG-20260811-xtconstant-001] `MARKET_SH_CONVERT_5_CANCEL=42` (沪市票五档即成剩撤) 必须暴露 — backend `qmt_gateway.py` 默认 `order_type='market'` 走此常量, 缺失 = SH 票市价单 AttributeError + kill_switch 紧急清仓失效 (资金安全事件). 真值来源: 迅投知识库附录 + 项目 test_qmt_gateway_status_map.py::_inject_fake_xtquant 双源坐实. AST 守卫 `tests/unit/infrastructure/test_no_xtconstant_typo.py` 锁回归.
 
 `get_full_tick/get_ticks` 的 `codes` 参数支持两种写法：传合约代码如 `["600000.SH", "000001.SZ"]` 查询指定标的；传市场代码如 `["SH", "SZ"]` 查询全市场全推快照。
 

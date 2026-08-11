@@ -979,7 +979,11 @@ class BigQmtXtData:
             "close": event.get("close"),
             "volume": event.get("volume"),
             "amount": event.get("amount"),
-            "time": event.get("bar_time") or "",
+            # [BUG-20260811-etf-tick-time] 空 time 不再产生: bar_time 优先 (QMT 端
+            # row.time 真 tick 时间), 缺失兜底 created_at (QMT 端北京墙上时间,
+            # "%Y-%m-%d %H:%M:%S", pump ~1s cadence 精度, parse_tick_time ISO 格式兼容).
+            # 禁后端 datetime.now() fallback (timezone-001 防跨日/跨时区漂移).
+            "time": event.get("bar_time") or event.get("created_at") or "",
         }
         try:
             callback({stock_code: [bar]})

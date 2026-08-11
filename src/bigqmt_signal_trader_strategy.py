@@ -788,6 +788,11 @@ def _push_quote_updates(context_info, config):
                 "close": close,
                 "volume": cell.get("volume"),
                 "amount": cell.get("amount"),
+                # [BUG-20260811-etf-tick-time] 真 tick 时间必须进 event: 旧 row 缺 time →
+                # normalize_quote_event bar_time="" → backend _dispatch_quote_event 组
+                # time="" → ETFScalpStrategy.parse_tick_time fail-CLOSED raise → 每 tick
+                # 丢弃 → ETF 连上也不交易 (2026-08-11 实测 14:56 on_tick 连续异常).
+                "time": cell.get("time"),
             }
             event = quote_events.normalize_quote_event(
                 seq=seq_val, stock_code=stock_code, period="1m",

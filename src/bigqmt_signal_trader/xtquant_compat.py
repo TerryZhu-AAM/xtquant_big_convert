@@ -884,10 +884,14 @@ class BigQmtXtData:
         self._code_to_seq[stock_code] = seq
         # [quote_events] 清同 code 旧 seq — 防订阅 hash 无限堆积 (每次重订阅新建 seq
         # 不清旧, 实测 498 条/15 code). pump 全量取会放大 Redis 写. hlen>50 才清摊销成本.
+        # [2026-08-12 审查] 阈值 50 → 10: 88 条堆积实况 (600309×23/601899×22/603993×22
+        # 等 08-10/11 残留) 导致 QMT 端 quote_push 全量推 88 票 → backend cb_found=False
+        # 路由丢弃 + 刷屏. 每次 subscribe 清同 code 旧 seq 摊销成本 < 10 条 hgetall, 阈值
+        # 降到 10 让清理更早触发.
         try:
             _redis = self.client._redis()
             _sub_key = "bigqmt:quote_subscriptions:%s" % (self.client.account_id or "")
-            if _redis.hlen(_sub_key) > 50:
+            if _redis.hlen(_sub_key) > 10:
                 _stale = []
                 for _k, _v in _redis.hgetall(_sub_key).items():
                     try:

@@ -138,8 +138,10 @@ class FakeRpcClient:
     def save_quote_subscription(self, seq, payload, active=True):
         if active:
             self.redis.hset("bigqmt:quote_subscriptions:%s" % self.account_id, str(seq), payload)
+            return True
         else:
             self.redis.hdel("bigqmt:quote_subscriptions:%s" % self.account_id, str(seq))
+            return True
 
 
 class FakeRedisEvents:
@@ -410,6 +412,90 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertIn((key, str(seq)), xtdata.client.redis.deleted)
         self.assertEqual(xtdata.client.redis.events[0][0], "subscribe_quote")
         self.assertEqual(xtdata.client.redis.events[1][0], "unsubscribe_quote")
+
+    # --- BUG-20260813-quote-callback-seq-mismatch ---
+
+    def test_dispatch_fallback_on_stale_seq(self):
+        """QMT 推旧 seq (hash 未更新) → _dispatch_quote_event 通过 _code_to_seq
+        反查活 seq → 找到 callback → 成功路由. 防持仓股卖出规则失明."""
+        xtdata = self._xtdata()
+        calls = []
+        cb = lambda datas: calls.append(datas)
+
+        seq_a = xtdata.subscribe_quote("601869.SH", period="1m", callback=cb)
+        # re-subscribe → new seq, _code_to_seq now points to seq_b
+        seq_b = xtdata.subscribe_quote("601869.SH", period="1m", callback=cb)
+        self.assertNotEqual(seq_a, seq_b)
+
+        # simulate callback loss: remove old seq callback
+        xtdata._quote_callbacks.pop(seq_a, None)
+
+        # clear initial-snapshot calls from subscribe_quote
+        calls.clear()
+
+        # dispatch event with OLD seq → should fallback to seq_b callback
+        import json as _json
+        event = _json.dumps({
+            "event_type": "quote", "seq": seq_a,
+            "stock_code": "601869.SH", "period": "1m",
+            "close": 350.0, "volume": 100, "amount": 35000,
+        })
+        xtdata._dispatch_quote_event(event)
+
+        self.assertEqual(len(calls), 1)
+        self.assertIn("601869.SH", calls[0])
+
+    def test_dispatch_no_callback_returns_silently(self):
+        """Unknown seq + unknown stock_code → silent return (no crash)."""
+        xtdata = self._xtdata()
+        import json as _json
+        event = _json.dumps({
+            "event_type": "quote", "seq": 99999,
+            "stock_code": "999999.SH", "period": "1m",
+            "close": 10.0,
+        })
+        # should not raise
+        xtdata._dispatch_quote_event(event)
+
+    def test_save_quote_subscription_returns_true_on_success(self):
+        """save_quote_subscription hset success → returns True."""
+        xtdata = self._xtdata()
+        result = xtdata.client.save_quote_subscription(
+            42, {"seq": 42, "stock_code": "600000.SH"}, active=True
+        )
+        self.assertTrue(result)
+
+    def test_save_quote_subscription_retries_on_failure(self):
+        """hset raises → retries 3x → returns False."""
+        import json as _json
+        from bigqmt_signal_trader.xtquant_compat import BigQmtRpcClient
+
+        class FailingRedis:
+            def __init__(self):
+                self.call_count = 0
+            def hset(self, *a, **kw):
+                self.call_count += 1
+                raise Exception("simulated Redis failure")
+            def hdel(self, *a, **kw):
+                pass
+            def hgetall(self, key):
+                return {}
+            def hlen(self, key):
+                return 0
+
+        class FailingClient(BigQmtRpcClient):
+            def __init__(self):
+                self.account_id = "test"
+                self._fake_redis = FailingRedis()
+            def _redis(self):
+                return self._fake_redis
+
+        client = FailingClient()
+        result = client.save_quote_subscription(
+            42, {"seq": 42, "stock_code": "600000.SH"}, active=True
+        )
+        self.assertFalse(result)
+        self.assertEqual(client._fake_redis.call_count, 3)
 
     def test_optional_xtquant_shim_imports_constants_and_classes(self):
         from xtquant import xtconstant

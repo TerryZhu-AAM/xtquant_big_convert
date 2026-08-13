@@ -580,20 +580,34 @@ class BigQmtRpcClient:
         return event
 
     def save_quote_subscription(self, seq, payload, active=True):
+        """Persist / remove a subscribe_quote entry in the Redis hash.
+
+        Returns ``True`` on success, ``False`` on failure.  Retries 3× on
+        ``hset`` failure so a transient Redis hiccup does not leave the hash
+        out-of-sync (旧 seq 被清 + 新 seq 没写 → QMT 推旧 seq → backend 找不到
+        callback → 持仓股卖出规则失明, BUG-20260813-quote-callback-seq-mismatch).
+        """
         account_id = str(self.account_id or "")
         key = "bigqmt:quote_subscriptions:%s" % account_id
         redis_client = self._redis()
         if active:
             value = json.dumps(payload or {}, ensure_ascii=False, default=str)
-            try:
-                redis_client.hset(key, str(seq), value)
-            except Exception:
-                pass
+            for _attempt in range(3):
+                try:
+                    redis_client.hset(key, str(seq), value)
+                    return True
+                except Exception:
+                    if _attempt == 2:
+                        print("[bigqmt] save_quote_subscription hset failed 3x "
+                              "seq=%s code=%s" % (seq, (payload or {}).get("stock_code", "?")))
+                    time.sleep(0.05 * (_attempt + 1))
+            return False
         else:
             try:
                 redis_client.hdel(key, str(seq))
             except Exception:
                 pass
+            return True
 
 
 class BigQmtXtData:
@@ -877,7 +891,7 @@ class BigQmtXtData:
             "end_time": end_time,
             "count": count,
         }
-        self.client.save_quote_subscription(seq, payload, active=True)
+        _saved = self.client.save_quote_subscription(seq, payload, active=True)
         # [BUG-P2-20260811-bridge-unsubscribe-quote-001] 反向索引 stock_code -> seq,
         # 无条件维护 (admin_subscribe 不传 callback 也写 Redis hash, admin_unsubscribe
         # 需反查 seq 清 hash). 放 callback 块外覆盖所有 subscribe 调用路径.
@@ -888,22 +902,26 @@ class BigQmtXtData:
         # 等 08-10/11 残留) 导致 QMT 端 quote_push 全量推 88 票 → backend cb_found=False
         # 路由丢弃 + 刷屏. 每次 subscribe 清同 code 旧 seq 摊销成本 < 10 条 hgetall, 阈值
         # 降到 10 让清理更早触发.
-        try:
-            _redis = self.client._redis()
-            _sub_key = "bigqmt:quote_subscriptions:%s" % (self.client.account_id or "")
-            if _redis.hlen(_sub_key) > 10:
-                _stale = []
-                for _k, _v in _redis.hgetall(_sub_key).items():
-                    try:
-                        _p = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
-                        if _p.get("stock_code") == stock_code and str(_p.get("seq")) != str(seq):
-                            _stale.append(_k)
-                    except Exception:
-                        pass
-                if _stale:
-                    _redis.hdel(_sub_key, *_stale)
-        except Exception:
-            pass
+        # [BUG-20260813-quote-callback-seq-mismatch] 仅在 _saved=True 时清旧 seq:
+        # hset 失败时新 seq 没写进 hash, 清旧 seq 会导致该 code 在 hash 中完全消失
+        # → QMT 不推 → callback 永远不触发 (持仓股卖出规则失明).
+        if _saved is not False:
+            try:
+                _redis = self.client._redis()
+                _sub_key = "bigqmt:quote_subscriptions:%s" % (self.client.account_id or "")
+                if _redis.hlen(_sub_key) > 10:
+                    _stale = []
+                    for _k, _v in _redis.hgetall(_sub_key).items():
+                        try:
+                            _p = json.loads(_v.decode() if isinstance(_v, bytes) else _v)
+                            if _p.get("stock_code") == stock_code and str(_p.get("seq")) != str(seq):
+                                _stale.append(_k)
+                        except Exception:
+                            pass
+                    if _stale:
+                        _redis.hdel(_sub_key, *_stale)
+            except Exception:
+                pass
         self.client.publish_event("subscribe_quote", payload)
         if callback is not None:
             # [quote_events] register callback for real-time push dispatch. upstream
@@ -1078,7 +1096,18 @@ class BigQmtXtData:
         seq = event.get("seq")
         callback = self._quote_callbacks.get(seq)
         if callback is None:
-            return
+            # [BUG-20260813-quote-callback-seq-mismatch] Fallback: QMT 端 quote_push
+            # 读 Redis hash 决定用哪个 seq 推. 当 save_quote_subscription hset 曾失败
+            # 或 re-subscribe 后旧 callback 被清, QMT 可能仍推旧 seq → _quote_callbacks
+            # 查不到 → tick 静默丢弃 → 持仓股卖出规则失明 (601869.SH 实例).
+            # 通过 stock_code → _code_to_seq 反查当前活 seq → 找到 callback 兜底路由.
+            _code = str(event.get("stock_code") or "")
+            if _code:
+                _current_seq = self._code_to_seq.get(_code)
+                if _current_seq is not None and _current_seq != seq:
+                    callback = self._quote_callbacks.get(_current_seq)
+            if callback is None:
+                return
         stock_code = str(event.get("stock_code") or "")
         if not stock_code:
             return

@@ -32,39 +32,11 @@ DEFAULT_DOWNLOAD_FIELDS = ["open", "high", "low", "close", "volume", "amount"]
 _TIME_COL_NAMES = ("stime", "time", "index", "date", "datetime", "timetag")
 
 
-STOCK_BUY = 23
-STOCK_SELL = 24
-FIX_PRICE = 11
-LATEST_PRICE = 5
-MARKET_PEER_PRICE_FIRST = 44
-# [BUG-20260811-xtconstant-001] 三档 SH 市价常量必须同步暴露 (upstream xtquant SDK 真值,
-# 迅投知识库附录 http://docs.thinktrader.net/pages/198696/ + 项目 test_qmt_gateway_status_map
-# _inject_fake_xtconstant 双源坐实). 此前只暴露 LIMIT (43), 缺 CANCEL (42) 导致 qmt_gateway
-# SH 票市价单 AttributeError (pullback_ma5 buy 默认 order_type='market' + emergency_liquidate
-# kill_switch 紧急清仓 market 全踩). 同步暴露 LIMIT + CANCEL 防漂移.
-MARKET_SH_CONVERT_5_CANCEL = 42
-MARKET_SH_CONVERT_5_LIMIT = 43
-MARKET_SZ_CONVERT_5_CANCEL = 47
-SZ_MARKET = 1
-SH_MARKET = 0
-
 CLIENT_CONFIG_MODULE_ENV = "BIGQMT_CLIENT_CONFIG_MODULE"
 DEFAULT_CLIENT_CONFIG_MODULES = (
     "bigqmt_signal_trader_client_config",
     "bigqmt_signal_trader_local_config",
 )
-
-ORDER_UNREPORTED = 48
-ORDER_WAIT_REPORTING = 49
-ORDER_REPORTED = 50
-ORDER_REPORTED_CANCEL = 51
-ORDER_PARTSUCC_CANCEL = 52
-ORDER_PART_CANCEL = 53
-ORDER_CANCELED = 54
-ORDER_PART_SUCC = 55
-ORDER_SUCCEEDED = 56
-ORDER_JUNK = 57
-ORDER_UNKNOWN = 255
 
 # ---------------------------------------------------------------------------
 # xtconstant 枚举常量（对齐原生 MiniQMT xtquant/xtconstant.py，91 个全量）

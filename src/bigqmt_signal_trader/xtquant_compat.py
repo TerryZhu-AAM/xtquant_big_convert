@@ -66,6 +66,123 @@ ORDER_SUCCEEDED = 56
 ORDER_JUNK = 57
 ORDER_UNKNOWN = 255
 
+# ---------------------------------------------------------------------------
+# xtconstant 枚举常量（对齐原生 MiniQMT xtquant/xtconstant.py，91 个全量）
+# ---------------------------------------------------------------------------
+
+# 账号类型
+FUTURE_ACCOUNT = 1            # 期货
+SECURITY_ACCOUNT = 2          # 股票
+CREDIT_ACCOUNT = 3            # 信用
+FUTURE_OPTION_ACCOUNT = 5     # 期货期权
+STOCK_OPTION_ACCOUNT = 6      # 股票期权
+HUGANGTONG_ACCOUNT = 7        # 沪港通
+SHENGANGTONG_ACCOUNT = 11     # 深港通
+
+# 委托类型 - 期货六键风格
+FUTURE_OPEN_LONG = 0                  # 开多
+FUTURE_CLOSE_LONG_HISTORY = 1         # 平昨多
+FUTURE_CLOSE_LONG_TODAY = 2           # 平今多
+FUTURE_OPEN_SHORT = 3                 # 开空
+FUTURE_CLOSE_SHORT_HISTORY = 4        # 平昨空
+FUTURE_CLOSE_SHORT_TODAY = 5          # 平今空
+# 委托类型 - 期货四键风格
+FUTURE_CLOSE_LONG_TODAY_FIRST = 6     # 平多，优先平今
+FUTURE_CLOSE_LONG_HISTORY_FIRST = 7   # 平多，优先平昨
+FUTURE_CLOSE_SHORT_TODAY_FIRST = 8    # 平空，优先平今
+FUTURE_CLOSE_SHORT_HISTORY_FIRST = 9  # 平空，优先平昨
+# 委托类型 - 期货两键风格
+FUTURE_CLOSE_LONG_TODAY_HISTORY_THEN_OPEN_SHORT = 10  # 卖出，优先平仓平今，余量开空
+FUTURE_CLOSE_LONG_HISTORY_TODAY_THEN_OPEN_SHORT = 11  # 卖出，优先平仓平昨，余量开空
+FUTURE_CLOSE_SHORT_TODAY_HISTORY_THEN_OPEN_LONG = 12  # 买入，优先平仓平今，余量开多
+FUTURE_CLOSE_SHORT_HISTORY_TODAY_THEN_OPEN_LONG = 13  # 买入，优先平仓平昨，余量开多
+FUTURE_OPEN = 14               # 买入，不优先平仓
+FUTURE_CLOSE = 15              # 卖出，不优先平仓
+# 委托类型 - 期货跨商品套利
+FUTURE_ARBITRAGE_OPEN = 16               # 开仓
+FUTURE_ARBITRAGE_CLOSE_HISTORY_FIRST = 17  # 平，优先平昨
+FUTURE_ARBITRAGE_CLOSE_TODAY_FIRST = 18    # 平，优先平今
+# 委托类型 - 期货展期
+FUTURE_RENEW_LONG_CLOSE_HISTORY_FIRST = 19   # 看多，优先平昨
+FUTURE_RENEW_LONG_CLOSE_TODAY_FIRST = 20     # 看多，优先平今
+FUTURE_RENEW_SHORT_CLOSE_HISTORY_FIRST = 21  # 看空，优先平昨
+FUTURE_RENEW_SHORT_CLOSE_TODAY_FIRST = 22    # 看空，优先平今
+
+# 委托类型 - 股票
+STOCK_BUY = 23
+STOCK_SELL = 24
+# 委托类型 - 信用交易
+CREDIT_BUY = 23                       # 担保品买入
+CREDIT_SELL = 24                      # 担保品卖出
+CREDIT_FIN_BUY = 27                   # 融资买入
+CREDIT_SLO_SELL = 28                  # 融券卖出
+CREDIT_BUY_SECU_REPAY = 29            # 买券还券
+CREDIT_DIRECT_SECU_REPAY = 30         # 直接还券
+CREDIT_SELL_SECU_REPAY = 31           # 卖券还款
+CREDIT_DIRECT_CASH_REPAY = 32         # 直接还款
+CREDIT_FIN_BUY_SPECIAL = 40           # 专项融资买入
+CREDIT_SLO_SELL_SPECIAL = 41          # 专项融券卖出
+CREDIT_BUY_SECU_REPAY_SPECIAL = 42    # 专项买券还券
+CREDIT_DIRECT_SECU_REPAY_SPECIAL = 43  # 专项直接还券
+CREDIT_SELL_SECU_REPAY_SPECIAL = 44   # 专项卖券还款
+CREDIT_DIRECT_CASH_REPAY_SPECIAL = 45  # 专项直接还款
+
+# 委托类型 - 股票期权
+STOCK_OPTION_BUY_OPEN = 48       # 买入开仓
+STOCK_OPTION_SELL_CLOSE = 49     # 卖出平仓
+STOCK_OPTION_SELL_OPEN = 50      # 卖出开仓
+STOCK_OPTION_BUY_CLOSE = 51      # 买入平仓
+STOCK_OPTION_COVERED_OPEN = 52   # 备兑开仓
+STOCK_OPTION_COVERED_CLOSE = 53  # 备兑平仓
+STOCK_OPTION_CALL_EXERCISE = 54  # 认购行权
+STOCK_OPTION_PUT_EXERCISE = 55   # 认沽行权
+STOCK_OPTION_SECU_LOCK = 56      # 证券锁定
+STOCK_OPTION_SECU_UNLOCK = 57    # 证券解锁
+
+# 委托类型 - 期货期权
+OPTION_FUTURE_OPTION_EXERCISE = 100  # 期货期权行权
+
+# 报价类型（市价）
+LATEST_PRICE = 5                        # 最新价
+FIX_PRICE = 11                          # 指定价/限价
+MARKET_SH_CONVERT_5_CANCEL = 42         # 最优五档即时成交剩余撤销[上交所][股票]
+MARKET_SH_CONVERT_5_LIMIT = 43          # 最优五档即时成交剩转限价[上交所][股票]
+MARKET_PEER_PRICE_FIRST = 44            # 对手方最优价格委托
+MARKET_MINE_PRICE_FIRST = 45            # 本方最优价格委托
+MARKET_SZ_INSTBUSI_RESTCANCEL = 46      # 即时成交剩余撤销委托[深交所][股票][期权]
+MARKET_SZ_CONVERT_5_CANCEL = 47         # 最优五档即时成交剩余撤销[深交所][股票][期权]
+MARKET_SZ_FULL_OR_CANCEL = 48           # 全额成交或撤销委托[深交所][股票][期权]
+
+# 市场代码
+SH_MARKET = 0
+SZ_MARKET = 1
+
+# 委托状态
+ORDER_UNREPORTED = 48
+ORDER_WAIT_REPORTING = 49
+ORDER_REPORTED = 50
+ORDER_REPORTED_CANCEL = 51
+ORDER_PARTSUCC_CANCEL = 52
+ORDER_PART_CANCEL = 53
+ORDER_CANCELED = 54
+ORDER_PART_SUCC = 55
+ORDER_SUCCEEDED = 56
+ORDER_JUNK = 57
+ORDER_UNKNOWN = 255
+
+# 账号状态
+ACCOUNT_STATUS_INVALID = -1       # 无效
+ACCOUNT_STATUS_OK = 0             # 正常
+ACCOUNT_STATUS_WAITING_LOGIN = 1  # 连接中
+ACCOUNT_STATUSING = 2             # 登陆中
+ACCOUNT_STATUS_FAIL = 3           # 失败
+ACCOUNT_STATUS_INITING = 4        # 初始化中
+ACCOUNT_STATUS_CORRECTING = 5     # 数据刷新校正中
+ACCOUNT_STATUS_CLOSED = 6         # 收盘后
+ACCOUNT_STATUS_ASSIS_FAIL = 7     # 穿透副链接断开
+ACCOUNT_STATUS_DISABLEBYSYS = 8   # 系统停用
+ACCOUNT_STATUS_DISABLEBYUSER = 9  # 用户停用
+
 
 class CompatObject:
     """Small attribute object matching xtquant's object-style returns."""

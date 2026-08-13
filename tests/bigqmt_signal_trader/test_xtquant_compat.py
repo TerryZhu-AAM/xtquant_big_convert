@@ -466,7 +466,7 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertTrue(result)
 
     def test_save_quote_subscription_retries_on_failure(self):
-        """hset raises → retries 3x → returns False."""
+        """hset raises → retries 2x → returns False."""
         import json as _json
         from bigqmt_signal_trader.xtquant_compat import BigQmtRpcClient
 
@@ -495,7 +495,7 @@ class XtquantCompatTest(unittest.TestCase):
             42, {"seq": 42, "stock_code": "600000.SH"}, active=True
         )
         self.assertFalse(result)
-        self.assertEqual(client._fake_redis.call_count, 3)
+        self.assertEqual(client._fake_redis.call_count, 2)
 
     def test_optional_xtquant_shim_imports_constants_and_classes(self):
         from xtquant import xtconstant

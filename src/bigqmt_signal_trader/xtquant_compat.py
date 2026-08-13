@@ -582,23 +582,25 @@ class BigQmtRpcClient:
     def save_quote_subscription(self, seq, payload, active=True):
         """Persist / remove a subscribe_quote entry in the Redis hash.
 
-        Returns ``True`` on success, ``False`` on failure.  Retries 3× on
+        Returns ``True`` on success, ``False`` on failure.  Retries 2× on
         ``hset`` failure so a transient Redis hiccup does not leave the hash
         out-of-sync (旧 seq 被清 + 新 seq 没写 → QMT 推旧 seq → backend 找不到
         callback → 持仓股卖出规则失明, BUG-20260813-quote-callback-seq-mismatch).
+        2 retries = max 150ms block (50+100ms); 启动期批量 subscribe 500+ 票
+        不会因 Redis 持续故障阻塞过久加剧 RPC 风暴.
         """
         account_id = str(self.account_id or "")
         key = "bigqmt:quote_subscriptions:%s" % account_id
         redis_client = self._redis()
         if active:
             value = json.dumps(payload or {}, ensure_ascii=False, default=str)
-            for _attempt in range(3):
+            for _attempt in range(2):
                 try:
                     redis_client.hset(key, str(seq), value)
                     return True
                 except Exception:
-                    if _attempt == 2:
-                        print("[bigqmt] save_quote_subscription hset failed 3x "
+                    if _attempt == 1:
+                        print("[bigqmt] save_quote_subscription hset failed 2x "
                               "seq=%s code=%s" % (seq, (payload or {}).get("stock_code", "?")))
                     time.sleep(0.05 * (_attempt + 1))
             return False
@@ -902,10 +904,10 @@ class BigQmtXtData:
         # 等 08-10/11 残留) 导致 QMT 端 quote_push 全量推 88 票 → backend cb_found=False
         # 路由丢弃 + 刷屏. 每次 subscribe 清同 code 旧 seq 摊销成本 < 10 条 hgetall, 阈值
         # 降到 10 让清理更早触发.
-        # [BUG-20260813-quote-callback-seq-mismatch] 仅在 _saved=True 时清旧 seq:
+        # [BUG-20260813-quote-callback-seq-mismatch] 仅在 _saved is True 时清旧 seq:
         # hset 失败时新 seq 没写进 hash, 清旧 seq 会导致该 code 在 hash 中完全消失
         # → QMT 不推 → callback 永远不触发 (持仓股卖出规则失明).
-        if _saved is not False:
+        if _saved is True:
             try:
                 _redis = self.client._redis()
                 _sub_key = "bigqmt:quote_subscriptions:%s" % (self.client.account_id or "")

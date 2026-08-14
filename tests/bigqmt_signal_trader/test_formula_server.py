@@ -485,5 +485,135 @@ class StaleViewGuardTest(unittest.TestCase):
         self.assertEqual(fs._yyyymmdd(None), "")
 
 
+class StaleViewFreshnessTest(unittest.TestCase):
+    """v2 freshness dimension — a mid-session freeze must not pass the guard.
+
+    A view frozen at 11:00 still answers "some bar today", so the zero-bar
+    check alone would feed half-day data to virtual-K synthesis. The newest
+    current-day bar must trail the window's expected edge by <= 5 minutes;
+    lunch and post-close windows expect the session edge, not wall-clock now.
+    """
+
+    FRIDAY_1430 = datetime.datetime(2026, 8, 14, 14, 30, 0)
+    FRIDAY_NOON = datetime.datetime(2026, 8, 14, 12, 0, 0)
+    FRIDAY_1530 = datetime.datetime(2026, 8, 14, 15, 30, 0)
+
+    TODAY_WINDOW = {
+        "field_list": ["close", "volume"],
+        "stock_list": ["600048.SH"],
+        "period": "1m",
+        "start_time": "20260814093000",
+        "end_time": "20260814150000",
+    }
+
+    def setUp(self):
+        self._orig_now = fs._local_now
+        fs._local_now = lambda: self.FRIDAY_1430
+
+    def tearDown(self):
+        fs._local_now = self._orig_now
+
+    def _router(self, stamps):
+        return fs.FormulaServerRouter(
+            enabled=True,
+            client=_StaleFakeFormulaClient(stamps),
+            print_prefix="[bigqmt_formula:test]",
+        )
+
+    def test_mid_session_freeze_falls_back_to_rpc(self):
+        # Today bars exist but stop at 10:30 while the window expects ~14:30 —
+        # the zero-bar check would pass this; freshness must not.
+        router = self._router(["20260814 10:30:00"])
+        with self.assertRaises(fs.Unroutable):
+            router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(router.stale_hits, 1)
+
+    def test_trailing_bar_within_lag_served_direct(self):
+        router = self._router(["20260814 14:28:00"])  # 2-minute lag
+        router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(router.hits, 1)
+        self.assertEqual(router.stale_hits, 0)
+
+    def test_lunch_expects_morning_close(self):
+        fs._local_now = lambda: self.FRIDAY_NOON
+        fresh = self._router(["20260814 11:30:00"])
+        fresh.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(fresh.hits, 1)  # 11:30 edge served, lag 0
+        frozen = self._router(["20260814 10:00:00"])
+        with self.assertRaises(fs.Unroutable):
+            frozen.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(frozen.stale_hits, 1)  # 90-min lag vs 11:30 edge
+
+    def test_after_close_expects_1500(self):
+        fs._local_now = lambda: self.FRIDAY_1530
+        fresh = self._router(["20260814 15:00:00"])
+        fresh.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(fresh.hits, 1)
+        frozen = self._router(["20260814 14:00:00"])
+        with self.assertRaises(fs.Unroutable):
+            frozen.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(frozen.stale_hits, 1)
+
+    def test_explicit_end_clamps_expectation(self):
+        # Window ends 10:30 — a healthy view must serve up to 10:30 even at 14:30.
+        window = dict(self.TODAY_WINDOW, end_time="20260814103000")
+        fresh = self._router(["20260814 10:29:00"])
+        fresh.call("get_market_data_ex", window)
+        self.assertEqual(fresh.hits, 1)
+        frozen = self._router(["20260814 09:40:00"])
+        with self.assertRaises(fs.Unroutable):
+            frozen.call("get_market_data_ex", window)
+        self.assertEqual(frozen.stale_hits, 1)
+
+    def test_date_granularity_stamp_skips_freshness(self):
+        # Daily bars stamped 00:00:00 carry no intraday time — the zero-bar
+        # check governs them; freshness must not flag every healthy 1d read.
+        router = self._router(["20260814 00:00:00"])
+        router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(router.hits, 1)
+        self.assertEqual(router.stale_hits, 0)
+
+    def test_expected_latest_hhmm_shapes(self):
+        self.assertEqual(
+            fs._expected_latest_hhmm(self.FRIDAY_1430, ""), "143000"
+        )  # afternoon session: expect up to now
+        self.assertEqual(
+            fs._expected_latest_hhmm(self.FRIDAY_NOON, ""), "113000"
+        )  # lunch: expect the morning close edge
+        self.assertEqual(
+            fs._expected_latest_hhmm(self.FRIDAY_1530, ""), "150000"
+        )  # after close: expect the 15:00 edge
+        self.assertEqual(
+            fs._expected_latest_hhmm(self.FRIDAY_1430, "20260814103000"), "103000"
+        )  # explicit intraday end clamps below session close
+        self.assertEqual(
+            fs._expected_latest_hhmm(self.FRIDAY_1430, "20260814"), "143000"
+        )  # date-only end = up to now
+
+    def test_guard_error_fails_through_and_is_visible(self):
+        import contextlib
+        import io
+
+        router = self._router(["20260814 14:29:00"])
+        orig = fs._yyyymmdd
+
+        def _boom(_stamp):
+            raise ValueError("guard internals broken")
+
+        fs._yyyymmdd = _boom
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                result = router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        finally:
+            fs._yyyymmdd = orig
+        # fail-through: the direct answer survives a broken guard...
+        self.assertEqual(len(result["600048.SH"]["records"]), 1)
+        self.assertEqual(router.hits, 1)
+        self.assertEqual(router.stale_hits, 0)
+        # ...but not silently — the throttled diagnostic must fire.
+        self.assertIn("stale-view guard check failed", out.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

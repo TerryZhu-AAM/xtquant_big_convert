@@ -75,6 +75,53 @@ def _yyyymmdd(stamp):
     return digits[:8]
 
 
+# A-share sessions for the stale-view guard's freshness dimension: same-day
+# reads expect bars up to "now" while the market is open, and up to the last
+# session close during lunch / after close.
+_SESSION_MINUTES = ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
+# 1m bars trail wall-clock by seconds-to-minutes, never hours; the 14:57-15:00
+# closing auction can thin the tail bars — 5 minutes absorbs both without
+# letting a mid-session freeze through.
+_STALE_VIEW_MAX_LAG_MIN = 5
+# Stamps before the morning open (date-granularity daily bars stamped
+# '00:00:00') carry no intraday time — freshness does not apply to them.
+_INTRADAY_STAMP_FLOOR = "093000"
+
+
+def _hhmmss(stamp):
+    """Digits 9-14 of a timestamp string — HHMMSS, '' when absent."""
+    digits = "".join(char for char in str(stamp or "") if char.isdigit())
+    return digits[8:14]
+
+
+def _minutes(hhmmss):
+    """HHMMSS → minutes past midnight."""
+    return int(hhmmss[:2]) * 60 + int(hhmmss[2:4])
+
+
+def _expected_latest_hhmm(now, end_time):
+    """HHMMSS of the newest bar a healthy view must hold for this window.
+
+    Open-ended or date-only end_time means "up to now", capped at the most
+    recent session close (a lunch-hour window expects the 11:30 edge, not
+    wall-clock now). An explicit intraday end_time clamps further: the view
+    must serve up to that minute. Never expects anything beyond now.
+    """
+    now_min = now.hour * 60 + now.minute
+    cap = None  # newest minute any session has opened by now
+    for opens_at, closes_at in _SESSION_MINUTES:
+        if now_min >= opens_at:
+            cap = closes_at
+    end_digits = "".join(char for char in str(end_time or "") if char.isdigit())
+    if len(end_digits) >= 12:  # explicit intraday end '20260814103000'
+        end_min = int(end_digits[8:10]) * 60 + int(end_digits[10:12])
+        if cap is None or end_min < cap:
+            cap = end_min
+    if cap is None or cap > now_min:
+        cap = now_min
+    return "%02d%02d00" % divmod(cap, 60)
+
+
 class FormulaServerError(RuntimeError):
     """FormulaServer answered with a non-zero status (bad params, no such method)."""
 
@@ -627,6 +674,7 @@ class FormulaServerRouter(object):
         self.misses = 0
         self.stale_hits = 0
         self._last_stale_note = 0.0
+        self._last_guard_note = 0.0
 
     def _available(self):
         if not self.enabled or self.client is None:
@@ -664,7 +712,9 @@ class FormulaServerRouter(object):
         carries no bar stamped today, treat the read as unroutable so the
         caller re-reads over RPC. Per-call only: purely historical windows
         keep the fast path, and the router stays available for other methods.
-        Guard-internal failures fall through to the direct answer.
+        Guard-internal failures fall through to the direct answer, with a
+        throttled diagnostic print — a silently broken guard would be
+        indistinguishable from no guard.
         """
         if method != "get_market_data_ex":
             return False
@@ -681,12 +731,27 @@ class FormulaServerRouter(object):
                 return False  # purely historical — the frozen view is fine
             if start and start > today:
                 return False  # future window, nothing expected yet
+            latest_today = None  # HHMMSS of the newest current-day bar
             for envelope in (result or {}).values():
                 for record in (envelope or {}).get("records") or []:
                     if _yyyymmdd(record.get("stime")) == today:
-                        return False  # fresh — at least one bar for today
-            return True
-        except Exception:
+                        hhmmss = _hhmmss(record.get("stime"))
+                        if hhmmss and (latest_today is None or hhmmss > latest_today):
+                            latest_today = hhmmss
+            if latest_today is None:
+                return True  # zero bars for the current day — fully frozen view
+            # Freshness (v2): a view frozen mid-session answers with morning
+            # bars only; the zero-bar check passes it and virtual-K synthesis
+            # would run on half-day data — worse than a clean 0-buy day
+            # because the partial series can still clear the volume gates and
+            # produce wrong decisions. The newest current-day bar must trail
+            # the window's expected edge by no more than _STALE_VIEW_MAX_LAG_MIN.
+            if latest_today < _INTRADAY_STAMP_FLOOR:
+                return False  # date-granularity stamp — no intraday time to check
+            expected = _expected_latest_hhmm(now, params.get("end_time"))
+            return (_minutes(expected) - _minutes(latest_today)) > _STALE_VIEW_MAX_LAG_MIN
+        except Exception as exc:
+            self._note_guard_error(exc)
             return False
 
     def _note_stale(self, method):
@@ -698,6 +763,15 @@ class FormulaServerRouter(object):
                 "the window expected them — re-reading over RPC (guard: "
                 "BUG-20260814-formula-58600-stale-view)"
                 % (self.print_prefix, method)
+            )
+
+    def _note_guard_error(self, exc):
+        now = time.time()
+        if now - self._last_guard_note >= 60.0:
+            self._last_guard_note = now
+            print(
+                "%s stale-view guard check failed (guard skipped for this call): %r"
+                % (self.print_prefix, exc)
             )
 
     def call(self, method, params=None):

@@ -676,6 +676,17 @@ class FormulaServerRouter(object):
         self.stale_guard_errors = 0  # [P3] guard check exceptions — visible in stats()
         self._last_stale_note = 0.0
         self._last_guard_note = 0.0
+        # Stale-view circuit breaker: after N consecutive stale hits on
+        # get_market_data_ex, stop trying the direct path for a cooldown
+        # period (exponential backoff, 60s → 120s → 240s → 300s cap). This
+        # prevents every call from wasting a socket round-trip + guard
+        # computation when the view is known frozen.
+        self._stale_consecutive = 0
+        self._stale_degraded_until = 0.0
+        self._stale_cooldown_seconds = 60.0
+        self._STALE_COOLDOWN_INITIAL = 60.0
+        self._STALE_COOLDOWN_MAX = 300.0
+        self._STALE_CONSECUTIVE_THRESHOLD = 3
 
     def _available(self):
         if not self.enabled or self.client is None:
@@ -690,11 +701,17 @@ class FormulaServerRouter(object):
         )
 
     def supports(self, method):
-        return (
-            str(method) in self.methods
-            and str(method) not in self._unimplemented
-            and self._available()
-        )
+        if (
+            str(method) not in self.methods
+            or str(method) in self._unimplemented
+            or not self._available()
+        ):
+            return False
+        # Stale-view circuit breaker: if get_market_data_ex has been
+        # consecutively stale, skip the direct path during cooldown.
+        if str(method) == "get_market_data_ex" and time.time() < self._stale_degraded_until:
+            return False
+        return True
 
     def _stale_market_data(self, method, params, result):
         """[BUG-20260814-formula-58600-stale-view] frozen-view guard for bar reads.
@@ -817,11 +834,28 @@ class FormulaServerRouter(object):
             self.misses += 1
             self.stale_hits += 1
             self._note_stale(method)
+            # Stale-view circuit breaker: count consecutive stale hits
+            self._stale_consecutive += 1
+            if self._stale_consecutive >= self._STALE_CONSECUTIVE_THRESHOLD:
+                self._stale_degraded_until = time.time() + self._stale_cooldown_seconds
+                print(
+                    "%s stale-view circuit breaker: %d consecutive stale hits, "
+                    "entering cooldown for %.0fs (will retry after)"
+                    % (self.print_prefix, self._stale_consecutive, self._stale_cooldown_seconds)
+                )
+                # Exponential backoff for next cooldown
+                self._stale_cooldown_seconds = min(
+                    self._stale_cooldown_seconds * 2, self._STALE_COOLDOWN_MAX
+                )
             raise Unroutable(
                 "%s: stale FormulaServer view (no bars for today) — re-read over RPC"
                 % method
             )
         self.hits += 1
+        # Reset stale consecutive counter on successful hit
+        if method == "get_market_data_ex":
+            self._stale_consecutive = 0
+            self._stale_cooldown_seconds = self._STALE_COOLDOWN_INITIAL
         if not self._announced:
             self._announced = True
             print(
@@ -831,12 +865,18 @@ class FormulaServerRouter(object):
         return result
 
     def stats(self):
+        now = time.time()
+        stale_degraded = now < self._stale_degraded_until
+        stale_cooldown_remaining = max(0.0, self._stale_degraded_until - now)
         return {
             "enabled": self.enabled,
             "hits": self.hits,
             "misses": self.misses,
             "stale_hits": self.stale_hits,
             "stale_guard_errors": self.stale_guard_errors,
+            "stale_consecutive": self._stale_consecutive,
+            "stale_degraded": stale_degraded,
+            "stale_cooldown_remaining_seconds": round(stale_cooldown_remaining, 1),
             "available": self._available(),
             "unimplemented": sorted(self._unimplemented),
             "methods": sorted(self.methods),

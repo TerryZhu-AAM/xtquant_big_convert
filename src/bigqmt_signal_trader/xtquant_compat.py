@@ -718,6 +718,10 @@ class BigQmtXtData:
         self._code_to_seq = {}
         self._quote_event_thread = None
         self._quote_event_running = False
+        # Unified bar quality contract — cumulative violation counts + throttled
+        # print timestamps keyed by (violation_type, code).
+        self._quality_violation_counts = {}   # {type_str: int}
+        self._quality_violation_last_print = {}  # {(type_str, code): float}
 
     def _next_seq(self):
         self._subscribe_seq += 1
@@ -829,8 +833,12 @@ class BigQmtXtData:
         name = str(sector_name or "")
         try:
             return self._call("get_stock_list_in_sector", sector_name=sector_name, real_timetag=real_timetag) or []
-        except Exception:
-            pass
+        except Exception as exc:
+            # RPC failed — try fallback for well-known sectors, or re-raise.
+            print(
+                "[bigqmt_compat] get_stock_list_in_sector(%s) RPC failed: %s: %s"
+                % (sector_name, exc.__class__.__name__, exc)
+            )
         if name in ("沪深A股", "沪深A股".encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")):
             ticks = self.get_full_tick(["SH", "SZ"])
             return sorted(code for code in ticks.keys() if _is_hs_a_share(code))
@@ -859,7 +867,10 @@ class BigQmtXtData:
         )
         data = self._call("get_market_data", **params)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        return self._heal_adjusted("get_market_data", params, data)
+        data = self._heal_adjusted("get_market_data", params, data)
+        # Unified quality contract — record violations for monitoring.
+        self._check_bar_quality(data, context="get_market_data")
+        return data
 
     def get_market_data_ex(
         self,
@@ -888,13 +899,19 @@ class BigQmtXtData:
         data = self._call("get_market_data_ex", **params)
         # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
         data = self._heal_adjusted("get_market_data_ex", params, data)
+        # Unified quality contract — record violations for monitoring.
+        # Runs AFTER self-heal so we see the final quality, not intermediate.
+        self._check_bar_quality(data, context="get_market_data_ex")
         cache = self._local_cache()
         if cache is not None and isinstance(data, dict):
             for code, df in data.items():
                 try:
                     cache.write(code, period, df, dividend_type=dividend_type)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(
+                        "[bigqmt_compat] cache write failed code=%s period=%s: %s"
+                        % (code, period, exc)
+                    )
         return data
 
     def get_local_data(
@@ -989,6 +1006,98 @@ class BigQmtXtData:
             return False
         except Exception:
             return False
+
+    # ── Unified bar quality contract ──────────────────────────────────────────
+    # Single choke-point for "is this data trustworthy?" — every bar read goes
+    # through _check_bar_quality before returning to the caller. Violations are
+    # counted (quality_stats()) and printed (throttled) so corrupt data is
+    # never silently consumed.
+
+    # Quality violation types:
+    #   "all_zero_close"  — close column all 0.0 except possibly the last bar
+    #   "nan_heavy"       — >50% of close values are NaN
+    #   "negative_price"  — any close < 0
+    #   "empty"           — DataFrame is empty or code missing from dict
+
+    @staticmethod
+    def _check_bar_quality_frame(df):
+        """Check one DataFrame for quality violations.
+
+        Returns a list of violation type strings (empty = healthy).
+        """
+        violations = []
+        try:
+            cols = getattr(df, "columns", None)
+            if cols is None:
+                return violations
+            if "close" not in list(cols):
+                return violations
+            closes = df["close"]
+            n = len(closes)
+            if n == 0:
+                violations.append("empty")
+                return violations
+            # NaN ratio
+            nan_count = int(closes.isna().sum()) if hasattr(closes, "isna") else 0
+            if nan_count > n * 0.5:
+                violations.append("nan_heavy")
+            # Negative prices
+            try:
+                if bool((closes < 0).any()):
+                    violations.append("negative_price")
+            except Exception:
+                pass
+            # All-zero (head only — last bar may hold live price)
+            head = closes.iloc[:-1] if n > 1 else closes
+            if bool((head == 0).all()):
+                violations.append("all_zero_close")
+        except Exception:
+            pass
+        return violations
+
+    def _check_bar_quality(self, data, context=""):
+        """Run quality checks on bar data and record violations.
+
+        Works on DataFrame, {code: DataFrame}, or None. Returns True if any
+        violation was found (caller may use this to decide whether to warn).
+        """
+        if data is None:
+            return False
+        found = False
+        if isinstance(data, dict):
+            for code, frame in data.items():
+                vs = self._check_bar_quality_frame(frame)
+                if vs:
+                    found = True
+                    for v in vs:
+                        self._record_quality_violation(v, code, context)
+        else:
+            vs = self._check_bar_quality_frame(data)
+            if vs:
+                found = True
+                for v in vs:
+                    self._record_quality_violation(v, "*", context)
+        return found
+
+    def _record_quality_violation(self, violation_type, code, context=""):
+        """Increment counter + throttled print for a quality violation."""
+        self._quality_violation_counts[violation_type] = (
+            self._quality_violation_counts.get(violation_type, 0) + 1
+        )
+        key = (violation_type, code)
+        now = time.time()
+        last = self._quality_violation_last_print.get(key, 0.0)
+        if now - last >= 60.0:
+            self._quality_violation_last_print[key] = now
+            total = self._quality_violation_counts[violation_type]
+            print(
+                "[bigqmt_quality] %s code=%s total=%d%s"
+                % (violation_type, code, total, (" ctx=%s" % context) if context else "")
+            )
+
+    def quality_stats(self):
+        """Cumulative quality violation counts — queryable for monitoring."""
+        return dict(self._quality_violation_counts)
 
     def _ensure_server_raw(self, codes, period, start_time, end_time):
         """Trigger a server-side raw download so adjusted bars can be computed.
@@ -1139,8 +1248,12 @@ class BigQmtXtData:
                             pass
                     if _stale:
                         _redis.hdel(_sub_key, *_stale)
-            except Exception:
-                pass
+            except Exception as exc:
+                # Stale subscription cleanup failed — non-fatal, but log for visibility.
+                print(
+                    "[bigqmt_compat] subscribe_quote stale cleanup failed: %s: %s"
+                    % (exc.__class__.__name__, exc)
+                )
         self.client.publish_event("subscribe_quote", payload)
         if callback is not None:
             # [quote_events] register callback for real-time push dispatch. upstream
@@ -1161,8 +1274,16 @@ class BigQmtXtData:
                             count=count,
                         )
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                # Initial snapshot callback failed — subscription is registered
+                # but the caller never received the first data point. This is
+                # observable: downstream code expecting an immediate snapshot
+                # will see nothing until the next push.
+                print(
+                    "[bigqmt_compat] subscribe_quote(%s) initial snapshot callback "
+                    "failed (subscription still active, push will deliver next): %s: %s"
+                    % (stock_code, exc.__class__.__name__, exc)
+                )
         return seq
 
     def subscribe_quote2(self, stock_code, period="1d", start_time="", end_time="", count=0, dividend_type=None, callback=None):

@@ -1,3 +1,4 @@
+import datetime
 import os
 import sys
 import unittest
@@ -153,7 +154,13 @@ class ParamTranslationTest(unittest.TestCase):
 
         router.call(
             "get_market_data_ex",
-            {"field_list": ["close"], "stock_list": ["000001.SZ"], "dividend_type": "none"},
+            {
+                "field_list": ["close"],
+                "stock_list": ["000001.SZ"],
+                "dividend_type": "none",
+                "start_time": "20260701000000",
+                "end_time": "20260703150000",
+            },
         )
 
         self.assertEqual(client.calls[0][1]["dividendType"], "none")
@@ -174,7 +181,12 @@ class ParamTranslationTest(unittest.TestCase):
 
         out = router.call(
             "get_market_data_ex",
-            {"field_list": ["close", "volume"], "stock_list": ["000001.SZ", "600000.SH"]},
+            {
+                "field_list": ["close", "volume"],
+                "stock_list": ["000001.SZ", "600000.SH"],
+                "start_time": "20260701000000",
+                "end_time": "20260703150000",
+            },
         )
 
         self.assertEqual(out["000001.SZ"]["columns"], ["stime", "close", "volume"])
@@ -189,7 +201,12 @@ class ParamTranslationTest(unittest.TestCase):
 
         out = router.call(
             "get_market_data_ex",
-            {"field_list": ["close"], "stock_list": ["000001.SZ", "600000.SH"]},
+            {
+                "field_list": ["close"],
+                "stock_list": ["000001.SZ", "600000.SH"],
+                "start_time": "20260701000000",
+                "end_time": "20260703150000",
+            },
         )
 
         self.assertEqual(sorted(out), ["000001.SZ", "600000.SH"])
@@ -323,7 +340,13 @@ class ClientCallIntegrationTest(unittest.TestCase):
         client = self._client(router)
 
         out = client.call(
-            "get_market_data_ex", {"field_list": ["close"], "stock_list": ["000001.SZ"]}
+            "get_market_data_ex",
+            {
+                "field_list": ["close"],
+                "stock_list": ["000001.SZ"],
+                "start_time": "20260701000000",
+                "end_time": "20260703150000",
+            },
         )
 
         frame = out["000001.SZ"]
@@ -334,6 +357,132 @@ class ClientCallIntegrationTest(unittest.TestCase):
             self.assertEqual(frame.iloc[0]["close"], 10.29)
         else:
             self.assertEqual(frame, [{"stime": "20260703", "close": 10.29}])
+
+
+class _StaleFakeFormulaClient(object):
+    """Serves getMarketData with a caller-chosen list of bar stamps."""
+
+    host = "127.0.0.1"
+    port = 58600
+
+    def __init__(self, stamps):
+        self._stamps = list(stamps)
+
+    def request(self, func, wire_params):
+        timeline = []
+        for stamp in self._stamps:
+            timeline.extend([stamp, ["close", 1.0, "volume", 100]])
+        return {"result": ["600048.SH", timeline]}
+
+    def close(self):
+        pass
+
+
+class StaleViewGuardTest(unittest.TestCase):
+    """[BUG-20260814-formula-58600-stale-view] frozen-view guard.
+
+    On 2026-08-14 the C++ FormulaServer answered same-day 1m windows with
+    zero bars (view frozen at the previous close) while the RPC path had the
+    live data. The router must re-read such answers over RPC and leave purely
+    historical windows on the fast path.
+    """
+
+    FRIDAY_1430 = datetime.datetime(2026, 8, 14, 14, 30, 0)
+    SATURDAY_1000 = datetime.datetime(2026, 8, 15, 10, 0, 0)
+
+    TODAY_WINDOW = {
+        "field_list": ["close", "volume"],
+        "stock_list": ["600048.SH"],
+        "period": "1m",
+        "start_time": "20260814093000",
+        "end_time": "20260814150000",
+    }
+    HISTORICAL_WINDOW = {
+        "field_list": ["close", "volume"],
+        "stock_list": ["600048.SH"],
+        "period": "1m",
+        "start_time": "20260801000000",
+        "end_time": "20260813150000",
+    }
+    OPEN_ENDED_WINDOW = {
+        "field_list": ["close", "volume"],
+        "stock_list": ["600048.SH"],
+        "period": "1m",
+        "start_time": "",
+        "end_time": "",
+    }
+    YESTERDAY_ONLY = ["20260813 09:30:00", "20260813 15:00:00"]
+    WITH_TODAY = ["20260813 15:00:00", "20260814 14:29:00"]
+
+    def setUp(self):
+        self._orig_now = fs._local_now
+        fs._local_now = lambda: self.FRIDAY_1430
+
+    def tearDown(self):
+        fs._local_now = self._orig_now
+
+    def _router(self, stamps):
+        return fs.FormulaServerRouter(
+            enabled=True,
+            client=_StaleFakeFormulaClient(stamps),
+            print_prefix="[bigqmt_formula:test]",
+        )
+
+    def test_stale_same_day_window_falls_back_to_rpc(self):
+        router = self._router(self.YESTERDAY_ONLY)
+        with self.assertRaises(fs.Unroutable):
+            router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(router.stale_hits, 1)
+        self.assertEqual(router.misses, 1)
+
+    def test_fresh_today_bars_served_direct(self):
+        router = self._router(self.WITH_TODAY)
+        out = router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        records = out["600048.SH"]["records"]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(router.hits, 1)
+        self.assertEqual(router.stale_hits, 0)
+
+    def test_purely_historical_window_not_guarded(self):
+        router = self._router(self.YESTERDAY_ONLY)
+        router.call("get_market_data_ex", dict(self.HISTORICAL_WINDOW))
+        self.assertEqual(router.hits, 1)
+        self.assertEqual(router.stale_hits, 0)
+
+    def test_pre_market_not_guarded(self):
+        fs._local_now = lambda: datetime.datetime(2026, 8, 14, 9, 0, 0)
+        router = self._router(self.YESTERDAY_ONLY)
+        router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(router.stale_hits, 0)
+
+    def test_weekend_not_guarded(self):
+        fs._local_now = lambda: self.SATURDAY_1000
+        router = self._router(self.YESTERDAY_ONLY)
+        router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(router.stale_hits, 0)
+
+    def test_open_ended_end_expects_today(self):
+        router = self._router(self.YESTERDAY_ONLY)
+        with self.assertRaises(fs.Unroutable):
+            router.call("get_market_data_ex", dict(self.OPEN_ENDED_WINDOW))
+        self.assertEqual(router.stale_hits, 1)
+
+    def test_stale_does_not_trip_the_global_cooldown(self):
+        # A frozen view is only stale for same-day reads; history must keep
+        # using the direct path immediately afterwards (no 30s breaker).
+        router = self._router(self.YESTERDAY_ONLY)
+        with self.assertRaises(fs.Unroutable):
+            router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        router.call("get_market_data_ex", dict(self.HISTORICAL_WINDOW))
+        self.assertEqual(router.hits, 1)
+        self.assertEqual(router.stale_hits, 1)
+
+    def test_yyyymmdd_tolerates_wire_shapes(self):
+        self.assertEqual(fs._yyyymmdd("20260813 09:30:00"), "20260813")
+        self.assertEqual(fs._yyyymmdd("20260813093000"), "20260813")
+        self.assertEqual(fs._yyyymmdd("2026-08-13 09:30:00"), "20260813")
+        self.assertEqual(fs._yyyymmdd(""), "")
+        self.assertEqual(fs._yyyymmdd(None), "")
 
 
 if __name__ == "__main__":

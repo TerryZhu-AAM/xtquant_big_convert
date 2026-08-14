@@ -34,6 +34,7 @@ Every failure here is non-fatal: :class:`FormulaServerRouter` reports the method
 as unroutable and the caller falls back to the normal RPC path.
 """
 
+import datetime
 import os
 import socket
 import struct
@@ -56,6 +57,22 @@ COMPRESS_DOUBLE_ZLIB = 2
 # FormulaServer's "method not found" code. Distinct from a transport failure:
 # it means the server is healthy and simply does not implement the call.
 ERROR_METHOD_NOT_FOUND = 200005
+
+
+def _local_now():
+    # Indirection point for tests (stale-view guard freezes the clock).
+    return datetime.datetime.now()
+
+
+def _yyyymmdd(stamp):
+    """Leading 8 digits of a timestamp string, separators tolerated.
+
+    Covers the wire shapes this bridge sees end to end — request windows
+    ('20260814093000') and returned bar stamps ('20260813 09:30:00',
+    '2026-08-13 09:30:00') all yield '20260813'.
+    """
+    digits = "".join(char for char in str(stamp or "") if char.isdigit())
+    return digits[:8]
 
 
 class FormulaServerError(RuntimeError):
@@ -608,6 +625,8 @@ class FormulaServerRouter(object):
         self._unimplemented = set()
         self.hits = 0
         self.misses = 0
+        self.stale_hits = 0
+        self._last_stale_note = 0.0
 
     def _available(self):
         if not self.enabled or self.client is None:
@@ -627,6 +646,59 @@ class FormulaServerRouter(object):
             and str(method) not in self._unimplemented
             and self._available()
         )
+
+    def _stale_market_data(self, method, params, result):
+        """[BUG-20260814-formula-58600-stale-view] frozen-view guard for bar reads.
+
+        The C++ FormulaServer answers from the terminal's persisted/local data
+        view. That view can be frozen at the previous session's close: on
+        2026-08-14 the QMT terminal cold-started mid-session (machine reboot
+        08:32, client up 10:12) and every getMarketData read over this direct
+        socket returned zero bars for the current day, while the RPC path
+        (strategy ContextInfo, live in-memory view) served them — the backend's
+        same-day 1m reads (pb virtual-K synthesis) starved a full session on
+        PRE_vk_insufficient.
+
+        Rule: when the requested window expects current-day bars (end_time at
+        or after today, open-ended end meaning "up to now") and the answer
+        carries no bar stamped today, treat the read as unroutable so the
+        caller re-reads over RPC. Per-call only: purely historical windows
+        keep the fast path, and the router stays available for other methods.
+        Guard-internal failures fall through to the direct answer.
+        """
+        if method != "get_market_data_ex":
+            return False
+        try:
+            now = _local_now()
+            today = now.strftime("%Y%m%d")
+            # Current-day bars are only expected on weekdays from 09:30 on.
+            if now.weekday() >= 5 or now.hour < 9 or (now.hour == 9 and now.minute < 30):
+                return False
+            start = _yyyymmdd(params.get("start_time"))
+            end = _yyyymmdd(params.get("end_time"))
+            window_end = end or today  # open-ended end = "up to now"
+            if not window_end or window_end < today:
+                return False  # purely historical — the frozen view is fine
+            if start and start > today:
+                return False  # future window, nothing expected yet
+            for envelope in (result or {}).values():
+                for record in (envelope or {}).get("records") or []:
+                    if _yyyymmdd(record.get("stime")) == today:
+                        return False  # fresh — at least one bar for today
+            return True
+        except Exception:
+            return False
+
+    def _note_stale(self, method):
+        now = time.time()
+        if now - self._last_stale_note >= 60.0:
+            self._last_stale_note = now
+            print(
+                "%s stale view on %s: answered no bars for the current day while "
+                "the window expected them — re-reading over RPC (guard: "
+                "BUG-20260814-formula-58600-stale-view)"
+                % (self.print_prefix, method)
+            )
 
     def call(self, method, params=None):
         """Serve ``method`` from FormulaServer, or raise :class:`Unroutable`."""
@@ -665,6 +737,14 @@ class FormulaServerRouter(object):
         except Exception as exc:
             self.misses += 1
             raise Unroutable("%s: result adaptation failed: %s" % (method, exc))
+        if self._stale_market_data(method, dict(params or {}), result):
+            self.misses += 1
+            self.stale_hits += 1
+            self._note_stale(method)
+            raise Unroutable(
+                "%s: stale FormulaServer view (no bars for today) — re-read over RPC"
+                % method
+            )
         self.hits += 1
         if not self._announced:
             self._announced = True
@@ -679,6 +759,7 @@ class FormulaServerRouter(object):
             "enabled": self.enabled,
             "hits": self.hits,
             "misses": self.misses,
+            "stale_hits": self.stale_hits,
             "available": self._available(),
             "unimplemented": sorted(self._unimplemented),
             "methods": sorted(self.methods),

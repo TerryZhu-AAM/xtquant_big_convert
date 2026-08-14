@@ -991,7 +991,12 @@ class BigQmtXtData:
             return False
 
     def _ensure_server_raw(self, codes, period, start_time, end_time):
-        """Trigger a server-side raw download so adjusted bars can be computed."""
+        """Trigger a server-side raw download so adjusted bars can be computed.
+
+        Best-effort: failures are non-fatal (the retry may still work if raw
+        data already exists server-side), but silently swallowing exceptions
+        makes debugging impossible — log a one-line diagnostic on failure.
+        """
         try:
             self.client.call(
                 "download_history_data2",
@@ -1003,28 +1008,79 @@ class BigQmtXtData:
                 },
                 timeout_seconds=60.0,
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            # [P7 root-cause fix] silent swallow → visible diagnostic. The bridge
+            # uses print() for all diagnostics (no logging framework). One line,
+            # no traceback — enough to grep, not enough to flood.
+            print(
+                "[bigqmt_compat] _ensure_server_raw failed (%d codes, period=%s): "
+                "%s: %s"
+                % (len(codes), period, exc.__class__.__name__, exc)
+            )
 
-    def _heal_adjusted(self, method, params, data, wait_seconds=2.0):
+    @staticmethod
+    def _zero_codes_from_data(data):
+        """Extract the subset of codes whose adjusted bars are all-zero.
+
+        Returns a list of codes that need re-downloading. For non-dict shapes
+        (single DataFrame), returns a sentinel ['*'] meaning 'all codes'.
+        """
+        if isinstance(data, dict):
+            result = []
+            for code, frame in data.items():
+                if BigQmtXtData._is_all_zero_any(frame):
+                    result.append(code)
+            return result
+        if BigQmtXtData._is_all_zero_any(data):
+            return ["*"]
+        return []
+
+    def _heal_adjusted(
+        self, method, params, data, max_wait_seconds=10.0, poll_interval=0.5
+    ):
         """Self-heal adjusted reads: if the adjusted pull came back all-zero,
-        trigger a server-side raw download, wait for async landing, retry once."""
+        trigger a server-side raw download, then poll until the data lands or
+        the timeout expires.
+
+        Root-cause fix for P5: the old ``time.sleep(2.0)`` + single retry failed
+        for large downloads where the server-side async landing took >2s. Now
+        we poll with short intervals up to ``max_wait_seconds``, returning the
+        first non-zero result. Only the all-zero codes are re-downloaded (P6),
+        not the entire batch.
+        """
         dividend_type = str(params.get("dividend_type") or "none").lower()
         if dividend_type in ("", "none"):
             return data
         if not self._is_all_zero_any(data):
             return data
-        codes = list(params.get("stock_list") or params.get("stock_code") or [])
-        if not codes:
+        all_codes = list(params.get("stock_list") or params.get("stock_code") or [])
+        if not all_codes:
             return data
+        # [P6 root-cause fix] Only re-download the codes that are actually
+        # all-zero, not the entire batch. For non-dict shapes, re-download all.
+        zero_codes = self._zero_codes_from_data(data)
+        target_codes = all_codes if "*" in zero_codes else zero_codes
         self._ensure_server_raw(
-            codes,
+            target_codes,
             params.get("period", "1d"),
             params.get("start_time", ""),
             params.get("end_time", ""),
         )
-        time.sleep(wait_seconds)
-        return self._call(method, **params)
+        # Poll until the data lands or timeout. Each poll re-reads from the
+        # server; the first non-zero result wins. The old single-shot retry
+        # with a hard-coded sleep was a race against the server's async
+        # landing — this poll loop removes the race entirely.
+        deadline = time.time() + max_wait_seconds
+        retry_params = dict(params)
+        while time.time() < deadline:
+            time.sleep(poll_interval)
+            retry_data = self._call(method, **retry_params)
+            if not self._is_all_zero_any(retry_data):
+                return retry_data
+            data = retry_data  # keep the latest for the final return
+        # Timeout: return the last result (still all-zero). The consumer
+        # (main repo scheduler_phases) detects zero and logs critical.
+        return data
 
     def _pull_and_cache(self, codes, period, start_time, end_time, count, dividend_type="none"):
         """Fetch codes over RPC (get_market_data_ex already caches them)."""

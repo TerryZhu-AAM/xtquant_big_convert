@@ -673,6 +673,7 @@ class FormulaServerRouter(object):
         self.hits = 0
         self.misses = 0
         self.stale_hits = 0
+        self.stale_guard_errors = 0  # [P3] guard check exceptions — visible in stats()
         self._last_stale_note = 0.0
         self._last_guard_note = 0.0
 
@@ -766,12 +767,13 @@ class FormulaServerRouter(object):
             )
 
     def _note_guard_error(self, exc):
+        self.stale_guard_errors += 1
         now = time.time()
         if now - self._last_guard_note >= 60.0:
             self._last_guard_note = now
             print(
-                "%s stale-view guard check failed (guard skipped for this call): %r"
-                % (self.print_prefix, exc)
+                "%s stale-view guard check failed (%d total, guard skipped for this call): %r"
+                % (self.print_prefix, self.stale_guard_errors, exc)
             )
 
     def call(self, method, params=None):
@@ -834,6 +836,7 @@ class FormulaServerRouter(object):
             "hits": self.hits,
             "misses": self.misses,
             "stale_hits": self.stale_hits,
+            "stale_guard_errors": self.stale_guard_errors,
             "available": self._available(),
             "unimplemented": sorted(self._unimplemented),
             "methods": sorted(self.methods),

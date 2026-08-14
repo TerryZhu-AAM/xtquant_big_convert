@@ -611,8 +611,14 @@ class StaleViewFreshnessTest(unittest.TestCase):
         self.assertEqual(len(result["600048.SH"]["records"]), 1)
         self.assertEqual(router.hits, 1)
         self.assertEqual(router.stale_hits, 0)
-        # ...but not silently — the throttled diagnostic must fire.
-        self.assertIn("stale-view guard check failed", out.getvalue())
+        # [P3 root-cause fix] the guard error counter must increment...
+        self.assertEqual(router.stale_guard_errors, 1)
+        # ...and appear in stats()...
+        self.assertEqual(router.stats()["stale_guard_errors"], 1)
+        # ...but not silently — the throttled diagnostic must fire with count.
+        output = out.getvalue()
+        self.assertIn("stale-view guard check failed", output)
+        self.assertIn("1 total", output)
 
 
 if __name__ == "__main__":

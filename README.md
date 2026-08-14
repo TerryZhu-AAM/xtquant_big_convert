@@ -194,6 +194,7 @@ xtdata.unsubscribe_quote(seq)
 - `get_divid_factors` / `get_risk_free_rate` —— 参数语义不同（区间 vs 单日、index vs timetag）。
 - **复权 K 线** —— 实测 `dividendType` 传 `none` 和 `front` 返回完全相同，复权未生效。因此只有
   `dividend_type="none"` 才走直连，其余回退 RPC，避免静默返回未复权价格。
+  （复权数据还需**先在服务端下载原始数据**，见下文「复权数据下载陷阱」。）
 
 配置（客户端侧，默认就是开启，通常不用写）：
 
@@ -277,6 +278,32 @@ QMT 原生安装、逐 Bar 同步协议、CSV 备用模式和安全边界见
 - `st="rpc_test"` → ORDER=3, DEAL=1（只有 rpc_test 的）
 - `st="bigqmt_signal_trader"` → ORDER=0, DEAL=0（空）
 
+### 复权数据下载陷阱（重要）
+
+**前/后复权 K 线必须先在服务端下载原始数据，否则返回全 0**。
+
+Big QMT 的复权（`dividend_type='front'`/`'back'`）是**服务端现场计算**的——需要原始 K 线 + 除权因子已经在服务端存在。直接请求 front 而服务端没下载过原始数据时，返回的 close 全是 `0.0`（只有最后一根有价）。
+
+实测复现（600654.SH / 600227.SH）：
+- 直接 `get_market_data_ex(dividend_type='front')` → 634 行全 0
+- 先 `download_history_data` 后再请求 → 真实复权价（front ≠ none，复权生效）
+
+**已修复**：`xtdata.download_history_data2(codes, period, dividend_type='front')` 现在会**自动先触发服务端原始数据下载**（拉原始 K 线 + 除权因子），再拉复权数据到本地缓存。用法不变：
+
+```python
+# 前复权下载（自动先服务端下载原始数据 + 除权因子）
+xtdata.download_history_data2(["600654.SH"], period="1d",
+                               start_time="20240101", dividend_type="front")
+
+# 之后本地读取（零 RPC）
+xtdata.get_local_data(["close"], ["600654.SH"], period="1d",
+                      start_time="20240101", dividend_type="front")
+```
+
+**读取类 API 也自愈**：`get_market_data_ex` / `get_market_data` 带复权参数时，若检测到返回全 0（服务端缺原始数据），会自动触发服务端下载、等待落盘、重试一次，拿到真实复权价。`get_local_data` 的 fallback 拉取同样受益。无需手动等待。
+
+注意：QMT 服务端下载是**异步落盘**的，自愈路径内置了等待 + 一次重试；极端大区间若一次重试仍全 0，可稍后重读或先显式 `download_history_data2`。
+
 ### 实盘卖出方向误判修复（exec_events）
 
 实盘发现：QMT 回调里 `m_nDirection` **恒为 48**（即使是卖出），导致卖出被误判为买入。
@@ -288,6 +315,60 @@ QMT 原生安装、逐 Bar 同步协议、CSV 备用模式和安全边界见
 4. `m_nOpType`/`order_type`（兜底）
 
 对股票现货，direction=offset（48=买/49=卖）；对期货，direction≠offset，仲裁保正确。
+
+### 多账号使用（股票+期货 / 普通+信用）
+
+当前架构是**单账号单实例**——一个 QMT 策略进程绑定一个账号，RPC channel 按 `account_id` 隔离（`bigqmt:rpc:req:{account_id}`）。多账号场景（如股票+期货、普通+信用账户同时交易）的推荐方案是**在 QMT 里跑多个策略实例**，每个实例绑一个账号。
+
+#### 方案：多策略实例（推荐，不改代码）
+
+**服务端（QMT 内）**：为每个账号创建一个独立的配置文件和 DRYRUN 入口。
+
+```python
+# bigqmt_signal_trader_local_config_stock.py  — 股票账号
+BIGQMT_ACCOUNT_ID = "你的股票账号"
+BIGQMT_REDIS_CONFIG = {
+    "host": "...", "port": 6379, "db": 5, "password": "...",
+    "transport": "redis",          # 或 "zmq"
+    "account_type": "STOCK",       # 股票
+    # ...
+}
+
+# bigqmt_signal_trader_local_config_credit.py  — 信用账号
+BIGQMT_ACCOUNT_ID = "你的信用账号"
+BIGQMT_REDIS_CONFIG = {
+    "host": "...", "port": 6379, "db": 5, "password": "...",
+    "transport": "redis",
+    "account_type": "CREDIT",      # 信用（两融）
+    # ...
+}
+```
+
+然后在 QMT 策略编辑器里加载两个 DRYRUN 文件（每个指向不同的配置），分别运行。两个实例的 RPC channel 自动隔离（按 account_id）。
+
+> **zmq 模式注意**：每个实例的 zmq 端口从 account_id 派生（`15560 + account_id mod 100`），不同账号自动不冲突。
+
+**客户端（外部程序）**：为每个账号创建独立的 client/trader 对象。
+
+```python
+from bigqmt_signal_trader.xtquant_compat import BigQmtRpcClient, BigQmtXtTrader, StockAccount
+
+# 股票账号
+stock_client = BigQmtRpcClient(account_id="股票账号", redis_config={...})
+stock_trader = BigQmtXtTrader(account_id="股票账号", redis_client=stock_client.redis_client)
+stock_acc = StockAccount("股票账号", "STOCK")
+
+# 信用账号
+credit_client = BigQmtRpcClient(account_id="信用账号", redis_config={...})
+credit_trader = BigQmtXtTrader(account_id="信用账号", redis_client=credit_client.redis_client)
+credit_acc = StockAccount("信用账号", "CREDIT")
+
+# 分别查询/下单
+stock_asset = stock_trader.query_stock_asset(stock_acc)
+credit_positions = credit_trader.query_stock_positions(credit_acc)
+```
+
+> **跨账号隔离**：每个账号的 RPC channel、持仓查询、委托回报完全隔离（按 `account_id` 路由），互不影响。
 
 ---
 

@@ -197,133 +197,147 @@ class TestUnifiedQualityLayer:
 
 
 class TestStaleCooldownCircuitBreaker:
-    """Test FormulaServer stale view circuit breaker with cooldown."""
+    """Circuit breaker behavior, verified END-TO-END through router.call().
+
+    A fake formula client serves a frozen (yesterday-only) view; the guard
+    must classify it stale, and 3 consecutive stale hits must degrade
+    get_market_data_ex in supports() until the cooldown expires.
+    """
+
+    FROZEN_STAMPS = ["20260813 15:00:00"]  # yesterday only -> stale for today window
+    TODAY_WINDOW = {
+        "field_list": ["close"],
+        "stock_list": ["600048.SH"],
+        "period": "1m",
+        "start_time": "20260814093000",
+        "end_time": "20260814150000",
+    }
 
     def setup_method(self):
-        """Create a fresh FormulaServerRouter for each test."""
-        self.router = FormulaServerRouter()
+        import datetime as _dt
 
-    def test_stale_consecutive_counter_increments(self):
-        """Stale consecutive counter increments on each stale detection."""
-        # Simulate stale detection by directly incrementing counter
-        self.router._stale_consecutive += 1
-        assert self.router._stale_consecutive == 1
+        import bigqmt_signal_trader.formula_server as fs_mod
 
-        self.router._stale_consecutive += 1
+        self._fs = fs_mod
+        self._orig_now = fs_mod._local_now
+        fs_mod._local_now = lambda: _dt.datetime(2026, 8, 14, 14, 30, 0)
+
+        class _FrozenClient:
+            host, port = "127.0.0.1", 58600
+
+            def request(self, func, wire_params):
+                timeline = []
+                for stamp in TestStaleCooldownCircuitBreaker.FROZEN_STAMPS:
+                    timeline.extend([stamp, ["close", 1.0, "volume", 100]])
+                return {"result": ["600048.SH", timeline]}
+
+            def close(self):
+                pass
+
+        self.router = fs_mod.FormulaServerRouter(client=_FrozenClient())
+
+    def teardown_method(self):
+        self._fs._local_now = self._orig_now
+
+    def _stale_call(self):
+        with pytest.raises(self._fs.Unroutable):
+            self.router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+
+    def test_two_stale_hits_no_degradation(self):
+        """Below threshold the router stays available for get_market_data_ex."""
+        self._stale_call()
+        self._stale_call()
         assert self.router._stale_consecutive == 2
-
-        self.router._stale_consecutive += 1
-        assert self.router._stale_consecutive == 3
-
-    def test_circuit_breaker_triggers_after_threshold(self):
-        """Circuit breaker triggers after 3 consecutive stale hits."""
-        # Below threshold - no degradation
-        self.router._stale_consecutive = 2
-        assert self.router._stale_degraded_until == 0.0
-
-        # At threshold - should trigger degradation
-        # (This would normally happen in call() method when _stale_market_data returns True)
-        self.router._stale_consecutive = 3
-        assert self.router._stale_consecutive >= self.router._STALE_CONSECUTIVE_THRESHOLD
-
-    def test_circuit_breaker_exponential_backoff(self):
-        """Circuit breaker uses exponential backoff (60s → 120s → 240s → 300s cap)."""
-        # Initial cooldown is 60s
-        assert self.router._stale_cooldown_seconds == 60.0
-
-        # After first trigger, should double to 120s
-        self.router._stale_cooldown_seconds = min(
-            self.router._stale_cooldown_seconds * 2, 
-            self.router._STALE_COOLDOWN_MAX
-        )
-        assert self.router._stale_cooldown_seconds == 120.0
-
-        # After second trigger, should double to 240s
-        self.router._stale_cooldown_seconds = min(
-            self.router._stale_cooldown_seconds * 2, 
-            self.router._STALE_COOLDOWN_MAX
-        )
-        assert self.router._stale_cooldown_seconds == 240.0
-
-        # After third trigger, should cap at 300s
-        self.router._stale_cooldown_seconds = min(
-            self.router._stale_cooldown_seconds * 2, 
-            self.router._STALE_COOLDOWN_MAX
-        )
-        assert self.router._stale_cooldown_seconds == 300.0
-
-        # Should stay at cap
-        self.router._stale_cooldown_seconds = min(
-            self.router._stale_cooldown_seconds * 2, 
-            self.router._STALE_COOLDOWN_MAX
-        )
-        assert self.router._stale_cooldown_seconds == 300.0
-
-    def test_circuit_breaker_resets_on_success(self):
-        """Circuit breaker resets counter on successful get_market_data_ex."""
-        # Build up stale counter
-        self.router._stale_consecutive = 2
-        self.router._stale_degraded_until = time.time() + 60
-        self.router._stale_cooldown_seconds = 120.0
-
-        # Simulate successful call (this happens in call() method at line 856-858)
-        method = "get_market_data_ex"
-        if method == "get_market_data_ex":
-            self.router._stale_consecutive = 0
-            self.router._stale_cooldown_seconds = self.router._STALE_COOLDOWN_INITIAL
-
-        assert self.router._stale_consecutive == 0
-        assert self.router._stale_cooldown_seconds == 60.0
-
-    def test_circuit_breaker_only_resets_for_get_market_data_ex(self):
-        """Circuit breaker only resets for get_market_data_ex, not other methods."""
-        # Build up stale counter
-        self.router._stale_consecutive = 2
-        self.router._stale_degraded_until = time.time() + 60
-        self.router._stale_cooldown_seconds = 120.0
-
-        # Successful call for different method should not reset
-        method = "get_instrument_detail"
-        if method == "get_market_data_ex":
-            self.router._stale_consecutive = 0
-            self.router._stale_cooldown_seconds = self.router._STALE_COOLDOWN_INITIAL
-
-        assert self.router._stale_consecutive == 2
-        assert self.router._stale_cooldown_seconds == 120.0
-
-    def test_supports_returns_false_during_cooldown(self):
-        """supports() returns False for get_market_data_ex during cooldown."""
-        # Trigger cooldown
-        self.router._stale_degraded_until = time.time() + 60
-
-        # Should not support get_market_data_ex during cooldown
-        assert self.router.supports("get_market_data_ex") is False
-
-        # Other methods should still be supported (if they exist in METHOD_MAP)
-        # get_instrument_detail is a valid method
-        assert self.router.supports("get_instrument_detail") is True
-
-    def test_supports_returns_true_after_cooldown(self):
-        """supports() returns True for get_market_data_ex after cooldown expires."""
-        # Cooldown already expired
-        self.router._stale_degraded_until = time.time() - 10
-
-        # Should support get_market_data_ex again
         assert self.router.supports("get_market_data_ex") is True
 
-    def test_stats_includes_cooldown_info(self):
-        """stats() includes stale degradation information."""
-        self.router._stale_consecutive = 2
-        self.router._stale_degraded_until = time.time() + 30
-
+    def test_circuit_breaker_triggers_after_three_stale_hits(self):
+        """3rd consecutive stale hit enters cooldown - supports() flips False."""
+        self._stale_call()
+        self._stale_call()
+        self._stale_call()
+        assert self.router._stale_consecutive == 3
+        assert self.router.stale_hits == 3
+        assert self.router._stale_degraded_until > 0
+        assert self.router.supports("get_market_data_ex") is False
         stats = self.router.stats()
-
-        assert "stale_consecutive" in stats
-        assert stats["stale_consecutive"] == 2
-        assert "stale_degraded" in stats
         assert stats["stale_degraded"] is True
-        assert "stale_cooldown_remaining_seconds" in stats
-        assert 25 < stats["stale_cooldown_remaining_seconds"] < 35
+        assert stats["stale_cooldown_remaining_seconds"] > 0
+
+    def test_circuit_breaker_cooldown_first_value_is_60s(self):
+        """First degradation arms the initial 60s cooldown (next armed at 120s)."""
+        for _ in range(3):
+            self._stale_call()
+        assert self.router._stale_cooldown_seconds == 120.0  # armed for NEXT time
+        remaining = self.router.stats()["stale_cooldown_remaining_seconds"]
+        assert 55.0 < remaining <= 60.0
+
+    def test_circuit_breaker_during_cooldown_other_methods_still_routed(self):
+        """Cooldown degrades only get_market_data_ex, not other methods."""
+        for _ in range(3):
+            self._stale_call()
+        assert self.router.supports("get_market_data_ex") is False
+        assert self.router.supports("get_instrument_detail") is True
+
+    def test_cooldown_expires_and_supports_returns_true(self):
+        """After the cooldown elapses, supports() recovers."""
+        for _ in range(3):
+            self._stale_call()
+        self.router._stale_degraded_until = time.time() - 1.0
+        assert self.router.supports("get_market_data_ex") is True
+
+    def test_circuit_breaker_resets_on_success(self):
+        """A fresh get_market_data_ex answer resets consecutive + cooldown."""
+        for _ in range(2):
+            self._stale_call()
+        # Fresh view: latest bar stamped today 14:29 (within the 5-min lag).
+        fresh = ["20260813 15:00:00", "20260814 14:29:00"]
+
+        class _FreshClient:
+            host, port = "127.0.0.1", 58600
+
+            def request(self, func, wire_params):
+                timeline = []
+                for stamp in fresh:
+                    timeline.extend([stamp, ["close", 1.0, "volume", 100]])
+                return {"result": ["600048.SH", timeline]}
+
+            def close(self):
+                pass
+
+        self.router.client = _FreshClient()
+        out = self.router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        assert "600048.SH" in out
+        assert self.router._stale_consecutive == 0
+        assert self.router._stale_cooldown_seconds == self.router._STALE_COOLDOWN_INITIAL
+        assert self.router.supports("get_market_data_ex") is True
+
+    def test_non_stale_method_does_not_reset_stale_counter(self):
+        """A successful non-market-data call must not clear stale state."""
+        for _ in range(2):
+            self._stale_call()
+
+        class _DetailClient:
+            host, port = "127.0.0.1", 58600
+
+            def request(self, func, wire_params):
+                return {"result": {"InstrumentName": "x"}}
+
+            def close(self):
+                pass
+
+        self.router.client = _DetailClient()
+        self.router.call("get_instrument_detail", {"code": "600048.SH"})
+        assert self.router._stale_consecutive == 2
+
+    def test_circuit_breaker_exponential_backoff(self):
+        """Backoff doubles 60-120-240-300 and stays capped at 300."""
+        cooldown = self.router._STALE_COOLDOWN_INITIAL
+        seen = []
+        for _ in range(4):
+            seen.append(cooldown)
+            cooldown = min(cooldown * 2, self.router._STALE_COOLDOWN_MAX)
+        assert seen == [60.0, 120.0, 240.0, 300.0]
+        assert cooldown == 300.0
 
 
 class TestCriticalBareExceptFixes:

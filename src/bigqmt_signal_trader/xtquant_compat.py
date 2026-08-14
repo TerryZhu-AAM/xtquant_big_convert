@@ -437,10 +437,16 @@ class BigQmtRpcClient:
             or ""
         )
         self.redis_client = redis_client
+        # [BUG-P0-20260810-redis-db-mismatch] db=0 是合法选择, 禁 `or` 短路 (falsy 0
+        # 会被吞成默认 5 → 客户端与 QMT 端 transport 连不同 DB, RPC 无人消费)。
+        # 与 redis_common.build_redis_client 同款显式 None/空串判断。
+        _db_value = merged_redis_config.get("db")
+        if _db_value is None or str(_db_value).strip() == "":
+            _db_value = _env_int("BIGQMT_REDIS_DB", 5)
         self.redis_config = {
             "host": merged_redis_config.get("host") or os.environ.get("BIGQMT_REDIS_HOST", "127.0.0.1"),
             "port": int(merged_redis_config.get("port") or _env_int("BIGQMT_REDIS_PORT", 6379)),
-            "db": int(merged_redis_config.get("db") or _env_int("BIGQMT_REDIS_DB", 5)),
+            "db": int(_db_value),
             "username": merged_redis_config.get("username", os.environ.get("BIGQMT_REDIS_USERNAME") or ""),
             "password": merged_redis_config.get("password", os.environ.get("BIGQMT_REDIS_PASSWORD") or ""),
         }
@@ -1018,6 +1024,21 @@ class BigQmtXtData:
     #   "nan_heavy"       — >50% of close values are NaN
     #   "negative_price"  — any close < 0
     #   "empty"           — DataFrame is empty or code missing from dict
+    #   "malformed_shape" — dict payload whose values are not bar frames/lists
+    #                       (e.g. a field-major dict or a leaked object dump);
+    #                       the per-code contract does not apply, so it is
+    #                       flagged instead of silently skipped
+
+    @staticmethod
+    def _looks_like_bar_frame(value):
+        """True when value can plausibly hold bars (DataFrame / list of rows).
+
+        Dict values are ambiguous: {code: DataFrame} (code-major) is the
+        documented bar shape, but {field: {code: [...]}} (field-major) and
+        garbage dumps also arrive as dicts. Callers treat a dict-of-non-bars
+        as malformed rather than iterating it as if keyed by codes.
+        """
+        return value is None or hasattr(value, "columns") or isinstance(value, (list, tuple))
 
     @staticmethod
     def _check_bar_quality_frame(df):
@@ -1065,12 +1086,17 @@ class BigQmtXtData:
             return False
         found = False
         if isinstance(data, dict):
-            for code, frame in data.items():
-                vs = self._check_bar_quality_frame(frame)
+            for key, value in data.items():
+                if not self._looks_like_bar_frame(value):
+                    # Not a bar frame — flag the payload shape itself.
+                    self._record_quality_violation("malformed_shape", str(key)[:32], context)
+                    found = True
+                    continue
+                vs = self._check_bar_quality_frame(value)
                 if vs:
                     found = True
                     for v in vs:
-                        self._record_quality_violation(v, code, context)
+                        self._record_quality_violation(v, key, context)
         else:
             vs = self._check_bar_quality_frame(data)
             if vs:
@@ -1137,6 +1163,11 @@ class BigQmtXtData:
         if isinstance(data, dict):
             result = []
             for code, frame in data.items():
+                # Skip non-bar values (field-major dicts / garbage dumps):
+                # a field name must never be sent to download_history_data2
+                # as if it were a stock code.
+                if not BigQmtXtData._looks_like_bar_frame(frame):
+                    return ["*"]
                 if BigQmtXtData._is_all_zero_any(frame):
                     result.append(code)
             return result

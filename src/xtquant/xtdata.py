@@ -64,8 +64,10 @@ def subscribe_whole_quote(code_list, callback=None):
     return _compat.xtdata.subscribe_whole_quote(code_list, callback=callback)
 
 
-def unsubscribe_quote(seq):
-    return _compat.xtdata.unsubscribe_quote(seq)
+def unsubscribe_quote(seq_or_code, period=None):
+    # 双签名兼容: (seq) 原生协议 + (code, period=) gateway_provider 调用范式。
+    # period kwarg 接受并转发 (compat 层按需忽略, 订阅时已存 period)。
+    return _compat.xtdata.unsubscribe_quote(seq_or_code, period=period)
 
 
 def run():
@@ -80,12 +82,12 @@ def getDividFactors(*args, **kwargs):
     return _compat.xtdata.get_divid_factors(*args, **kwargs)
 
 
-def download_history_data(stock_code, period, start_time="", end_time="", incrementally=None):
-    return _compat.xtdata.download_history_data(stock_code, period, start_time, end_time, incrementally)
+def download_history_data(stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):
+    return _compat.xtdata.download_history_data(stock_code, period, start_time, end_time, incrementally, dividend_type)
 
 
-def download_history_data2(stock_list, period, start_time="", end_time="", callback=None, incrementally=None):
-    return _compat.xtdata.download_history_data2(stock_list, period, start_time, end_time, callback, incrementally)
+def download_history_data2(stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None):
+    return _compat.xtdata.download_history_data2(stock_list, period, start_time, end_time, callback, incrementally, dividend_type, chunk_size)
 
 
 def get_trading_dates(market, start_time="", end_time="", count=-1):

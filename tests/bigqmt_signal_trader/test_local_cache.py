@@ -224,13 +224,15 @@ class AdjustedDownloadTest(unittest.TestCase):
         self.assertEqual(raw_call["period"], "1d")
         self.assertEqual(raw_call["start_time"], "20200101")
 
-    def test_none_download_skips_server_side_raw_download(self):
+    def test_none_download_also_triggers_server_side_raw_download(self):
+        # [fix 2026-08-20 subscribe-cap-storm] none 不再跳过服务端真下载:
+        # 旧行为 get 对 QMT 本地 store 缺失票逐票 quote subscribe (ErrorID 210000
+        # 订阅超过上限, 2026-08-20 实测 10470 次/日), 必须先把数据落到本地 store.
         xt = self._xt()
         xt.download_history_data2(["600000.SH"], "1d", dividend_type="none")
 
-        # Unadjusted pulls need no server-side download.
         method_calls = [m for m, _ in xt.client.call_params]
-        self.assertNotIn("download_history_data2", method_calls)
+        self.assertIn("download_history_data2", method_calls)
         self.assertIn("get_market_data_ex", method_calls)
 
     def test_front_download_survives_server_download_failure(self):

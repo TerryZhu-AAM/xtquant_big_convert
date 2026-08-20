@@ -1519,6 +1519,100 @@ class BigQmtXtData:
     def get_divid_factors(self, stock_code, start_time="", end_time=""):
         return self._call("get_divid_factors", stock_code=stock_code, start_time=start_time, end_time=end_time)
 
+    def download_server_raw(
+        self,
+        stock_list,
+        period,
+        start_time="",
+        end_time="",
+        batch_size=100,
+        timeout_seconds=60.0,
+        max_consecutive_failures=2,
+        max_total_seconds=600.0,
+    ):
+        """[fix 2026-08-20 subscribe-cap-storm] 服务端真批量下载 (native SDK, 数据服务通道).
+
+        背景: QMT 引擎 serve get_market_data_ex 时, 对本地 store 缺失的票退化为
+        逐票 quote subscribe — 2026-08-20 XtClient_datasource 实测 ErrorID 210000
+        (订阅超过上限) 10470 次/日 (15h 日线 4690 源于 daily sync + 18-19h 分钟线
+        5780 源于 minute ETL, 全部来自全市场 get 的 cache-miss); cache 命中的票
+        零订阅 (同日探针 tmp/probe_pre_close.py 6 次 get 零 onSubscribe).
+
+        本方法把数据先落到 QMT 本地 store (服务端 native download_history_data2,
+        走数据服务通道, 无订阅), 之后 caller 的 get 走本地 cache 命中, 消灭订阅风暴.
+
+        与 2026-08-11 移除的"预下载"区别: 旧版假下载 = client 侧 get 循环
+        (大 payload 连发 → QMT drain 堵死, BUG-20260811-rpc-storm); 本方法每次
+        RPC 只传 code 列表 + 收 ack, 下载在 QMT 进程内 native 完成.
+
+        Best-effort + 双重熔断: 连续 max_consecutive_failures 批失败即 abort
+        (维护窗口实测 2026-08-20 21:15: 单批 180s 全超时, 数据服务不可达时快速
+        退化为 legacy get 行为); 总耗时超 max_total_seconds 也 abort.
+
+        Env knob: BIGQMT_SERVER_DOWNLOAD=0 关闭 (ops 逃生舱, 行为回到纯 get).
+
+        Returns: {"ok": n, "fail": n, "aborted": bool, "total_batches": n}
+        """
+        codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
+        result = {"ok": 0, "fail": 0, "aborted": False, "total_batches": 0}
+        if not codes:
+            return result
+        if os.environ.get("BIGQMT_SERVER_DOWNLOAD", "1").strip() in ("0", "false", "False"):
+            result["aborted"] = True
+            return result
+        step = max(1, int(batch_size or 100))
+        total_batches = (len(codes) + step - 1) // step
+        result["total_batches"] = total_batches
+        t0 = time.time()
+        consecutive_failures = 0
+        for i in range(0, len(codes), step):
+            if (time.time() - t0) > float(max_total_seconds or 600.0):
+                print(
+                    "[bigqmt_compat] download_server_raw total budget %.0fs exceeded at batch %d/%d "
+                    "(period=%s) — abort rest, caller get 兜底"
+                    % (max_total_seconds, result["ok"] + result["fail"], total_batches, period)
+                )
+                result["aborted"] = True
+                break
+            batch = codes[i : i + step]
+            try:
+                self.client.call(
+                    "download_history_data2",
+                    {
+                        "stock_list": batch,
+                        "period": period,
+                        "start_time": start_time,
+                        "end_time": end_time,
+                    },
+                    timeout_seconds=float(timeout_seconds or 60.0),
+                )
+                result["ok"] += 1
+                consecutive_failures = 0
+            except Exception as exc:
+                result["fail"] += 1
+                consecutive_failures += 1
+                print(
+                    "[bigqmt_compat] download_server_raw batch %d/%d failed "
+                    "(%d codes, period=%s): %s: %s"
+                    % (
+                        result["ok"] + result["fail"],
+                        total_batches,
+                        len(batch),
+                        period,
+                        exc.__class__.__name__,
+                        exc,
+                    )
+                )
+                if consecutive_failures >= max(1, int(max_consecutive_failures or 2)):
+                    print(
+                        "[bigqmt_compat] download_server_raw %d consecutive failures — "
+                        "abort rest (data service unreachable?), caller get 兜底"
+                        % consecutive_failures
+                    )
+                    result["aborted"] = True
+                    break
+        return result
+
     def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None):
         """Pull bars from Big QMT over RPC and cache them locally, in batches.
 
@@ -1528,12 +1622,13 @@ class BigQmtXtData:
         (front-adjusted) data. ``callback`` (optional) is invoked once per stock with
         {finished, total, stockcode} — xtdata-style. Returns {finished, total}.
 
-        Adjusted data (dividend_type != none): Big QMT can only compute adjusted
-        bars after the RAW history + dividend factors are downloaded server-side.
-        Without that, get_market_data_ex(dividend_type='front') returns all-zero
-        closes (verified live). So we first trigger the server-side download
-        (download_history_data2 via RPC, which pulls raw bars + factors), then
-        pull the adjusted bars.
+        Server-side real download runs FIRST for ALL dividend types
+        ([fix 2026-08-20 subscribe-cap-storm]): without it, the get loop below makes
+        the QMT engine per-code SUBSCRIBE for local-store misses (ErrorID 210000
+        订阅超过上限 — see download_server_raw). Adjusted types additionally
+        require raw bars + dividend factors server-side (front-adjusted closes come
+        back all-zero otherwise, verified live), which the same download provides.
+        The pre-download is best-effort: on failure the get loop still runs.
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         if not codes:
@@ -1541,26 +1636,7 @@ class BigQmtXtData:
         if self._local_cache() is None:
             raise RuntimeError("local cache is disabled (set local_cache_enabled=True to download)")
 
-        # Server-side raw download first when adjustment is requested: QMT
-        # computes front/back-adjusted bars from raw bars + dividend factors,
-        # and both must already exist server-side or the result is all zeros.
-        normalized = str(dividend_type or "none").lower()
-        if normalized not in ("", "none"):
-            try:
-                self.client.call(
-                    "download_history_data2",
-                    {
-                        "stock_list": codes,
-                        "period": period,
-                        "start_time": start_time,
-                        "end_time": end_time,
-                    },
-                    timeout_seconds=60.0,
-                )
-            except Exception:
-                # Best-effort: some deployments lack the QMT global; the pull
-                # below may still work if raw data already exists server-side.
-                pass
+        self.download_server_raw(codes, period, start_time, end_time)
 
         total = len(codes)
         step = int(chunk_size or 300)

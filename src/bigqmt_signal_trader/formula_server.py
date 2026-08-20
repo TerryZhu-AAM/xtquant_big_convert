@@ -83,6 +83,66 @@ _SESSION_MINUTES = ((9 * 60 + 30, 11 * 60 + 30), (13 * 60, 15 * 60))
 # closing auction can thin the tail bars — 5 minutes absorbs both without
 # letting a mid-session freeze through.
 _STALE_VIEW_MAX_LAG_MIN = 5
+
+
+# [fix P1-6 adversarial review 2026-08-18] 半天日识别 — 与 backend/app/infrastructure/trading_calendar.py
+# _KNOWN_HALF_DAYS 同步. 半天日 13:00-15:00 不应判 _in_session=True (防 stale 检查误放行
+# 半日数据 + RPC fallback 噪声). 独立常量保 third_party 无 app.infrastructure 反向依赖.
+_BRIDGE_KNOWN_HALF_DAYS = frozenset({
+    (2024, 9, 30),
+    (2025, 1, 27), (2025, 1, 28),
+    (2025, 4, 30),
+    (2025, 9, 30),
+    (2026, 2, 12), (2026, 2, 13),
+    (2026, 9, 30),
+})
+
+
+def _is_half_day(now):
+    """半天日判定 (与 backend _KNOWN_HALF_DAYS 同步).
+
+    half-day: 11:30 后整天 non-session (沪深北半天日, e.g. 国庆前 / 春节前).
+    """
+    return (now.year, now.month, now.day) in _BRIDGE_KNOWN_HALF_DAYS
+
+
+def _in_session(now):
+    """A 股连续竞价时段 (09:30-11:30 + 13:00-15:00, 周末/午休/盘后/半天日 → False).
+
+    [fix BUG-P2-20260818-mock-tick-pump-bark-storm 2026-08-18]
+    [fix P1-6 adversarial review 2026-08-18] 加半天日识别, 半天日 13:00-15:00 → False.
+
+    单独复制定义保 third_party 无 app.infrastructure 反向依赖. 边界语义
+    与 backend/app/infrastructure/trading_calendar.py:is_trading_hours byte-equal:
+    11:30:00 整秒 = 午休起点 (最后交易秒 11:29:59),
+    13:00:00 = 下午开盘, 15:00:00 = 收盘.
+
+    节假日不由本 helper 识别 — 那些日期 13:00-15:00 会继续 stale 检查,
+    走 RPC fallback 兜底 (走 main.py:mock-tick-pump 守卫 1.5 + alert_digest
+    `_in_market_critical_window` is_trading_hours 化 三层防御).
+
+    Returns:
+        True = 当前在 A 股连续竞价时段, 应有新鲜 bar.
+        False = 非交易时段 (周末/集合竞价 09:00-09:30/午休 11:30-13:00/盘后 15:00+
+               / 半天日 11:30-15:00).
+    """
+    if now.weekday() >= 5:
+        return False
+    t = now.hour * 60 + now.minute
+    # 半天日: 11:30 后整天 non-session (上午正常 09:30-11:30)
+    if _is_half_day(now):
+        if t < 11 * 60 + 30:
+            return 9 * 60 + 30 <= t
+        return False
+    # 上午 09:30-11:30
+    if 9 * 60 + 30 <= t < 11 * 60 + 30:
+        return True
+    # 下午 13:00-15:00
+    if 13 * 60 <= t < 15 * 60:
+        return True
+    return False
+
+
 # Stamps before the morning open (date-granularity daily bars stamped
 # '00:00:00') carry no intraday time — freshness does not apply to them.
 _INTRADAY_STAMP_FLOOR = "093000"
@@ -739,8 +799,14 @@ class FormulaServerRouter(object):
         try:
             now = _local_now()
             today = now.strftime("%Y%m%d")
-            # Current-day bars are only expected on weekdays from 09:30 on.
-            if now.weekday() >= 5 or now.hour < 9 or (now.hour == 9 and now.minute < 30):
+            # Current-day bars are only expected during A-share 连续竞价 时段.
+            # 周末 / 集合竞价前 / 午休 / 盘后 → frozen view 是预期, 不需 stale 检查,
+            # 直接走 fast path (避免午休/盘后因 frozen view 误判 stale → Unroutable
+            # → 走慢 RPC → 连续 RPC timeout → mock-tick-pump Bark 风暴).
+            # [fix BUG-P2-20260818-mock-tick-pump-bark-storm 2026-08-18]
+            # 旧条件 `weekday>=5 or hour<9 or (hour==9 and minute<30)` 只覆盖周末+集合竞价.
+            # 补充 11:30-13:00 + 15:00+ 后, 修复午休期间 frozen view 误 Unroutable.
+            if not _in_session(now):
                 return False
             start = _yyyymmdd(params.get("start_time"))
             end = _yyyymmdd(params.get("end_time"))

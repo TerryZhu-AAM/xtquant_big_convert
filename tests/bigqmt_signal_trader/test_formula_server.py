@@ -492,6 +492,11 @@ class StaleViewFreshnessTest(unittest.TestCase):
     check alone would feed half-day data to virtual-K synthesis. The newest
     current-day bar must trail the window's expected edge by <= 5 minutes;
     lunch and post-close windows expect the session edge, not wall-clock now.
+
+    [fix BUG-P2-20260818-mock-tick-pump-bark-storm 2026-08-18] 午休/盘后冻结视图
+    是预期 (frozen view 在非交易时段是正常状态, 不是 stale), 守卫一律跳过 — 避免
+    Unroutable → 慢 RPC → mock-tick-pump Bark 风暴. 新语义: 午休/盘后无论视图
+    多旧都走 fast path (router.hits=1, no Unroutable).
     """
 
     FRIDAY_1430 = datetime.datetime(2026, 8, 14, 14, 30, 0)
@@ -534,25 +539,43 @@ class StaleViewFreshnessTest(unittest.TestCase):
         self.assertEqual(router.hits, 1)
         self.assertEqual(router.stale_hits, 0)
 
-    def test_lunch_expects_morning_close(self):
+    def test_lunch_skips_stale_check_altogether(self):
+        """[fix BUG-P2-20260818] 午休 12:00 frozen view 不算 stale, 直接走 fast path.
+        旧 v2 期望 11:30 边缘 → 10:00 算 90min lag → Unroutable,
+        新语义: 午休任何冻结视图都是预期, 守卫跳过 (无论多少 lag).
+        """
         fs._local_now = lambda: self.FRIDAY_NOON
+        # 新鲜 11:30 边缘 → fast path (旧 v2 行为也走 fast path).
         fresh = self._router(["20260814 11:30:00"])
         fresh.call("get_market_data_ex", dict(self.TODAY_WINDOW))
-        self.assertEqual(fresh.hits, 1)  # 11:30 edge served, lag 0
+        self.assertEqual(fresh.hits, 1)
+        self.assertEqual(fresh.stale_hits, 0)
+        # 旧的 10:00 视图 → 旧 v2 期望 Unroutable, 新语义直走 fast path.
+        # 修复: 避免午休期间 stale→Unroutable→慢 RPC→mock-tick-pump Bark 风暴.
         frozen = self._router(["20260814 10:00:00"])
-        with self.assertRaises(fs.Unroutable):
-            frozen.call("get_market_data_ex", dict(self.TODAY_WINDOW))
-        self.assertEqual(frozen.stale_hits, 1)  # 90-min lag vs 11:30 edge
+        frozen.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(frozen.hits, 1,
+            "午休期 10:00 frozen view 应走 fast path (新语义, 避免 Bark 风暴)")
+        self.assertEqual(frozen.stale_hits, 0,
+            "午休期不应触发 stale 检查")
 
-    def test_after_close_expects_1500(self):
+    def test_after_close_skips_stale_check_altogether(self):
+        """[fix BUG-P2-20260818] 盘后 15:30 frozen view 不算 stale.
+        旧 v2 期望 15:00 边缘 → 14:00 算 60min lag → Unroutable,
+        新语义: 盘后任何冻结视图都是预期, 守卫跳过 (无论多少 lag).
+        """
         fs._local_now = lambda: self.FRIDAY_1530
         fresh = self._router(["20260814 15:00:00"])
         fresh.call("get_market_data_ex", dict(self.TODAY_WINDOW))
         self.assertEqual(fresh.hits, 1)
+        self.assertEqual(fresh.stale_hits, 0)
+        # 旧的 14:00 视图 → 新语义走 fast path.
         frozen = self._router(["20260814 14:00:00"])
-        with self.assertRaises(fs.Unroutable):
-            frozen.call("get_market_data_ex", dict(self.TODAY_WINDOW))
-        self.assertEqual(frozen.stale_hits, 1)
+        frozen.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(frozen.hits, 1,
+            "盘后期 14:00 frozen view 应走 fast path (新语义)")
+        self.assertEqual(frozen.stale_hits, 0,
+            "盘后期不应触发 stale 检查")
 
     def test_explicit_end_clamps_expectation(self):
         # Window ends 10:30 — a healthy view must serve up to 10:30 even at 14:30.
@@ -619,6 +642,130 @@ class StaleViewFreshnessTest(unittest.TestCase):
         output = out.getvalue()
         self.assertIn("stale-view guard check failed", output)
         self.assertIn("1 total", output)
+
+
+class InSessionTradingHoursTest(unittest.TestCase):
+    """[fix BUG-P2-20260818-mock-tick-pump-bark-storm 2026-08-18]
+    formula_server._in_session(now) helper — 纯函数, 边界与 backend
+    trading_calendar.is_trading_hours byte-equal (保 third_party 无反向依赖).
+
+    半开区间:
+    09:30:00 ≤ t < 11:30:00 → True (上午)
+    13:00:00 ≤ t < 15:00:00 → True (下午)
+    11:30:00 ≤ t < 13:00:00 → False (午休)
+    15:00:00 ≤ t          → False (盘后)
+    集合竞价 09:00-09:30    → False (上午前)
+    周末 weekday>=5        → False
+    """
+
+    def test_morning_open_to_lunch(self):
+        # 09:30:00 整秒开启; 11:29:59 仍 True; 11:30:00 整秒 = 午休起点.
+        self.assertTrue(fs._in_session(datetime.datetime(2026, 8, 18, 9, 30, 0)))
+        self.assertTrue(fs._in_session(datetime.datetime(2026, 8, 18, 10, 30, 0)))
+        self.assertTrue(fs._in_session(datetime.datetime(2026, 8, 18, 11, 29, 59)))
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 11, 30, 0)))
+
+    def test_lunch_break(self):
+        # 11:30:00 ≤ t < 13:00:00 全段 False (午休).
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 11, 30, 0)))
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 12, 0, 0)))
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 12, 59, 59)))
+
+    def test_afternoon_open_to_close(self):
+        # 13:00:00 整秒开启 (上午最后交易秒 11:29:59, 下午第一秒 13:00:00).
+        self.assertTrue(fs._in_session(datetime.datetime(2026, 8, 18, 13, 0, 0)))
+        self.assertTrue(fs._in_session(datetime.datetime(2026, 8, 18, 14, 30, 0)))
+        self.assertTrue(fs._in_session(datetime.datetime(2026, 8, 18, 14, 59, 59)))
+        # 15:00:00 整秒 = 收盘.
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 15, 0, 0)))
+
+    def test_after_close(self):
+        # 15:00+ 全段 False (盘后).
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 15, 30, 0)))
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 18, 0, 0)))
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 23, 59, 59)))
+
+    def test_pre_open_auction(self):
+        # 09:00-09:30 集合竞价 → False.
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 8, 30, 0)))
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 9, 0, 0)))
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 18, 9, 29, 59)))
+
+    def test_weekend(self):
+        # 周六/日 → False (全天, 不论时间).
+        # weekday: Mon=0, Sat=5, Sun=6.
+        sat = datetime.datetime(2026, 8, 22, 10, 30, 0)  # Sat
+        sun = datetime.datetime(2026, 8, 23, 14, 0, 0)   # Sun
+        self.assertEqual(sat.weekday(), 5)
+        self.assertEqual(sun.weekday(), 6)
+        self.assertFalse(fs._in_session(sat))
+        self.assertFalse(fs._in_session(sun))
+
+
+class StaleGuardNonTradingHoursTest(unittest.TestCase):
+    """[fix BUG-P2-20260818-mock-tick-pump-bark-storm 2026-08-18]
+    _stale_market_data 应在 非交易时段 直接返 False (不 stale),
+    避免午休/盘后 frozen view 误 stale → Unroutable → 慢 RPC → Bark 风暴.
+    """
+
+    TODAY_WINDOW = {
+        "field_list": ["close", "volume"],
+        "stock_list": ["600048.SH"],
+        "period": "1m",
+        "start_time": "20260818100000",
+        "end_time": "20260818150000",
+    }
+    YESTERDAY_ONLY = ["20260813 09:30:00", "20260813 15:00:00"]
+
+    def setUp(self):
+        self._orig_now = fs._local_now
+
+    def tearDown(self):
+        fs._local_now = self._orig_now
+
+    def _router(self, stamps):
+        return fs.FormulaServerRouter(
+            enabled=True,
+            client=_StaleFakeFormulaClient(stamps),
+            print_prefix="[bigqmt_formula:test-trading-hours]",
+        )
+
+    def test_lunch_break_no_stale_check(self):
+        """午休 12:00 (周五) → frozen view 不算 stale, 直接 fast path."""
+        fs._local_now = lambda: datetime.datetime(2026, 8, 14, 12, 0, 0)
+        router = self._router(self.YESTERDAY_ONLY)
+        router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(router.hits, 1,
+            "午休应走 fast path (router.hits) 而非 stale→Unroutable")
+        self.assertEqual(router.stale_hits, 0)
+
+    def test_after_close_no_stale_check(self):
+        """盘后 18:00 → frozen view 不算 stale."""
+        fs._local_now = lambda: datetime.datetime(2026, 8, 14, 18, 0, 0)
+        router = self._router(self.YESTERDAY_ONLY)
+        router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(router.hits, 1)
+        self.assertEqual(router.stale_hits, 0)
+
+    def test_lunch_edge_113000_no_stale_check(self):
+        """11:30:00 整秒 (午休起点) → 不 stale."""
+        fs._local_now = lambda: datetime.datetime(2026, 8, 14, 11, 30, 0)
+        router = self._router(self.YESTERDAY_ONLY)
+        router.call("get_market_data_ex", dict(self.TODAY_WINDOW))
+        self.assertEqual(router.hits, 1)
+        self.assertEqual(router.stale_hits, 0)
+
+    def test_afternoon_open_130000_stale_check_resumes(self):
+        """13:00:00 整秒 → stale 检查恢复 (冷启动场景下老 view 仍判 stale).
+        验证 _in_session 边界正确: 12:59:59 False, 13:00:00 True."""
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 14, 12, 59, 59)))
+        self.assertTrue(fs._in_session(datetime.datetime(2026, 8, 14, 13, 0, 0)))
+
+    def test_pre_morning_edge_92959_no_stale_check(self):
+        """09:29:59 (集合竞价末) → 仍 False (09:30 前都不判 stale).
+
+        验证与原 `weekday>=5 or hour<9 or (hour==9 and minute<30)` 行为 byte-equal."""
+        self.assertFalse(fs._in_session(datetime.datetime(2026, 8, 14, 9, 29, 59)))
 
 
 if __name__ == "__main__":

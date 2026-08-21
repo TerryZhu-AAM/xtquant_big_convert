@@ -57,6 +57,13 @@ def _loads(raw_payload):
     return payload
 
 
+def _is_redis_timeout(exc):
+    name = exc.__class__.__name__.lower()
+    module = getattr(exc.__class__, "__module__", "")
+    text = str(exc).lower()
+    return ("redis" in module and "timeout" in name) or "timeout reading from socket" in text
+
+
 class RedisTransport(RpcTransport):
     """Redis-backed transport. Owns rpush/blpop/brpop/publish/setex."""
 
@@ -320,7 +327,13 @@ class RedisTransport(RpcTransport):
                     % (self.print_prefix, (time.time() - _drain_start) * 1000, processed)
                 )
                 break
-            item = self.listen_redis.lpop(self.request_queue)
+            try:
+                item = self.listen_redis.lpop(self.request_queue)
+            except Exception as exc:
+                if _is_redis_timeout(exc):
+                    print("%s ERROR drain timeout on LPOP queue=%s; skip this tick" % (self.print_prefix, self.request_queue))
+                    break
+                raise
             if not item:
                 break
             _req_start = time.time()

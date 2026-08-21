@@ -52,6 +52,12 @@ class FakeRpcClient:
                     "volume": 1000,
                     "available": 800,
                     "cost": 10.2,
+                    "price": 10.8,
+                    "market_value": 10800.0,
+                    "frozen_volume": 200,
+                    "on_road_volume": 5,
+                    "yesterday_volume": 900,
+                    "direction": 48,
                     "stock_name": "PF Bank",
                 }
             }
@@ -127,6 +133,25 @@ class FakeRpcClient:
         if method == "get_instrument_detail":
             return {"InstrumentStatus": 0, "code": params.get("code")}
         if method == "get_market_data_ex":
+            if params.get("stock_list") == ["159518.SZ"]:
+                try:
+                    import pandas as pd
+
+                    return {
+                        "159518.SZ": pd.DataFrame(
+                            {
+                                "stime": ["20250813 10:27:00", "20250813 10:28:00"],
+                                "time": [None, None],
+                                "open": [0.872, 0.873],
+                                "high": [0.873, 0.873],
+                                "low": [0.872, 0.872],
+                                "close": [0.872, 0.872],
+                                "volume": [2791.0, 1659.0],
+                            }
+                        )
+                    }
+                except Exception:
+                    return {"159518.SZ": []}
             return {"600000.SH": {"close": [10.0]}}
         if method == "ping":
             return {"pong": True}
@@ -233,6 +258,12 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(positions[0].stock_code, "600000.SH")
         self.assertEqual(positions[0].can_use_volume, 800)
         self.assertEqual(positions[0].avg_price, 10.2)
+        self.assertEqual(positions[0].price, 10.8)
+        self.assertEqual(positions[0].market_value, 10800.0)
+        self.assertEqual(positions[0].frozen_volume, 200)
+        self.assertEqual(positions[0].on_road_volume, 5)
+        self.assertEqual(positions[0].yesterday_volume, 900)
+        self.assertEqual(positions[0].direction, 48)
         self.assertEqual(single.stock_code, "600000.SH")
 
     def test_orders_trades_order_and_cancel_are_miniqmt_shaped(self):
@@ -262,6 +293,8 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(order_id, "sys-2")
         self.assertTrue(cancelled)
         self.assertEqual(trader.client.calls[-2][1]["price_type"], MARKET_PEER_PRICE_FIRST)
+        # strategy_name 默认 ""（返回全部委托），与服务端一致（strategy_name 陷阱）。
+        self.assertEqual(trader.client.calls[-4][1]["strategy_name"], "")
 
     def test_execution_snapshot_maps_orders_and_trades_with_one_rpc(self):
         trader = self._trader()
@@ -348,6 +381,32 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(detail["InstrumentStatus"], 0)
         self.assertEqual(sector_codes, ["000001.SZ", "300001.SZ", "600000.SH"])
         self.assertEqual(market_data["600000.SH"]["close"], [10.0])
+
+    def test_market_data_ex_normalizes_bigqmt_stime_to_miniqmt_shape(self):
+        try:
+            import pandas  # noqa: F401
+        except Exception:
+            self.skipTest("pandas not installed")
+
+        xtdata = self._xtdata()
+
+        data = xtdata.get_market_data_ex(
+            ["time", "open", "high", "low", "close", "volume"],
+            ["159518.SZ"],
+            period="1m",
+            start_time="20250601000000",
+            end_time="",
+            count=-1,
+        )
+        df = data["159518.SZ"]
+
+        self.assertEqual(list(df.index), ["20250813102700", "20250813102800"])
+        self.assertEqual(
+            list(df.columns),
+            ["time", "open", "high", "low", "close", "volume"],
+        )
+        self.assertEqual(int(df.iloc[0]["time"]), 1755052020000)
+        self.assertNotIn("stime", df.columns)
 
     def test_xtdata_full_tick_reads_redis_cache_and_renews_demand(self):
         xtdata = self._xtdata()
@@ -631,6 +690,25 @@ class XtquantCompatTest(unittest.TestCase):
         # request_id must be a real 32-char uuid hex, not a crash.
         self.assertEqual(len(request["request_id"]), 32)
         int(request["request_id"], 16)
+
+    def test_client_call_raises_on_server_error(self):
+        # issue #38: server_error（QMT 端诊断，如 passorder 提交但委托没进系统）
+        # 之前被 call() 静默丢弃，导致下单流程看不到真实原因。现在必须转成异常。
+        class _FakeTransport:
+            def send_request(self, request, timeout_seconds):
+                return {
+                    "ok": True,
+                    "data": {"status": "SUBMITTED", "order_sys_id": ""},
+                    "server_error": "passorder submitted but order not found in system",
+                }
+
+        client = BigQmtRpcClient(account_id="acct", redis_config={"host": "127.0.0.1"})
+        client.transport_name = "zmq"
+        client._transport_instance = _FakeTransport()
+
+        with self.assertRaises(RuntimeError) as ctx:
+            client.call("order_stock", {"stock_code": "600000.SH"})
+        self.assertIn("not found in system", str(ctx.exception))
 
     def test_zmq_with_explicit_address_never_builds_redis_discovery(self):
         client = BigQmtRpcClient(

@@ -9,13 +9,16 @@ import os
 import json
 import time
 import uuid
+import queue as _queue
 import threading
 import importlib
+import datetime as _dt
 from typing import Any, Dict, Iterable, List, Optional
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .redis_rpc import call_redis_rpc
+from .logging_setup import get_logger
 
 # [BUG-20260811-rpc-storm] RPC 并发限流 — QMT 端 transport 单线程 drain (QMT 沙箱禁
 # 后台线程, rpc_background_threads=False 是 B 机钦定), backend 并发 RPC 风暴涌入 Redis
@@ -27,8 +30,14 @@ _RPC_CONCURRENCY = int(os.environ.get("BIGQMT_RPC_CONCURRENCY", "3") or 3)
 _RPC_INFLIGHT = threading.Semaphore(max(1, _RPC_CONCURRENCY))
 
 
-# Default OHLCV fields pulled + cached by download_history_data*.
+log = get_logger("xtquant_compat")
+
+
+# Default OHLCV fields pulled + cached by get_local_data fallback_rpc.
 DEFAULT_DOWNLOAD_FIELDS = ["open", "high", "low", "close", "volume", "amount"]
+# Codes per get_market_data_ex request. One request carries a single RPC timeout,
+# so a wide stock_list either fits or loses everything (issue #47).
+DEFAULT_MARKET_DATA_CHUNK = 100
 _TIME_COL_NAMES = ("stime", "time", "index", "date", "datetime", "timetag")
 
 
@@ -295,6 +304,12 @@ def load_client_config(module_name=None):
         timeout_seconds = getattr(module, "BIGQMT_RPC_TIMEOUT_SECONDS", None)
         if timeout_seconds is None:
             timeout_seconds = redis_config.get("rpc_timeout_seconds")
+        download_wait_seconds = getattr(module, "BIGQMT_DOWNLOAD_WAIT_SECONDS", None)
+        if download_wait_seconds is None:
+            download_wait_seconds = redis_config.get("download_wait_seconds")
+        download_poll_interval_seconds = getattr(module, "BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS", None)
+        if download_poll_interval_seconds is None:
+            download_poll_interval_seconds = redis_config.get("download_poll_interval_seconds")
         full_tick_cache_config = dict(getattr(module, "BIGQMT_FULL_TICK_CACHE_CONFIG", {}) or {})
         for key in (
             "full_tick_cache_enabled",
@@ -316,6 +331,8 @@ def load_client_config(module_name=None):
             "account_id": account_id,
             "redis_config": redis_config,
             "timeout_seconds": timeout_seconds,
+            "download_wait_seconds": download_wait_seconds,
+            "download_poll_interval_seconds": download_poll_interval_seconds,
             "full_tick_cache_config": full_tick_cache_config,
             "local_cache_config": local_cache_config,
             "formula_server_config": formula_server_config,
@@ -361,6 +378,25 @@ def _safe_float(value, default=0.0):
         return default
 
 
+def _to_unix_seconds(value, default=0):
+    """Normalize a trade/order time into Unix seconds (MiniQMT semantics).
+
+    Accepts numeric epochs, ``YYYY-MM-DD HH:MM:SS[.ffffff]`` and
+    ``YYYYMMDDHHMMSS`` strings. Anything else falls back to ``default``.
+    """
+    if value is None or value == "":
+        return default
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y%m%d%H%M%S"):
+        try:
+            return int(time.mktime(time.strptime(text, fmt)))
+        except ValueError:
+            continue
+    return default
+
+
 def _as_list(value):
     if value is None:
         return []
@@ -394,6 +430,78 @@ def _restore_jsonable(value):
     return value
 
 
+def _digits_only(value):
+    return "".join(ch for ch in str(value or "") if ch.isdigit())
+
+
+def _parse_qmt_stime(value):
+    digits = _digits_only(value)
+    if len(digits) >= 14:
+        try:
+            return _dt.datetime.strptime(digits[:14], "%Y%m%d%H%M%S")
+        except ValueError:
+            return None
+    if len(digits) >= 8:
+        try:
+            return _dt.datetime.strptime(digits[:8], "%Y%m%d")
+        except ValueError:
+            return None
+    return None
+
+
+def _qmt_stime_index(value):
+    digits = _digits_only(value)
+    if len(digits) >= 14:
+        return digits[:14]
+    if len(digits) >= 8:
+        return digits[:8]
+    return str(value or "")
+
+
+def _qmt_datetime_to_epoch_ms(dt_value):
+    # QMT bar labels are China local time; MiniQMT's time column is epoch ms.
+    china_tz = _dt.timezone(_dt.timedelta(hours=8))
+    return int(dt_value.replace(tzinfo=china_tz).timestamp() * 1000)
+
+
+def _normalize_market_data_frame(df, field_list=None):
+    try:
+        columns = list(df.columns)
+    except Exception:
+        return df
+    if "stime" not in columns:
+        return df
+
+    requested = [str(field) for field in (field_list or [])]
+    try:
+        out = df.copy()
+        stimes = list(out["stime"])
+        out.index = [_qmt_stime_index(value) for value in stimes]
+        if "time" in out.columns or "time" in requested:
+            out["time"] = [
+                _qmt_datetime_to_epoch_ms(parsed) if parsed is not None else None
+                for parsed in (_parse_qmt_stime(value) for value in stimes)
+            ]
+        if requested:
+            keep = [field for field in requested if field in out.columns]
+            if keep:
+                return out[keep]
+        if "stime" in out.columns:
+            return out.drop(columns=["stime"])
+        return out
+    except Exception:
+        return df
+
+
+def _normalize_market_data_result(data, field_list=None):
+    if not isinstance(data, dict):
+        return data
+    return {
+        code: _normalize_market_data_frame(frame, field_list=field_list)
+        for code, frame in data.items()
+    }
+
+
 def _normalize_code_for_filter(code):
     text = str(code or "").strip().upper()
     if "." not in text:
@@ -413,6 +521,25 @@ def _is_hs_a_share(code):
     return pure.startswith(
         ("000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689")
     )
+
+
+def _full_a_share_code(code):
+    """Ensure a callback stock_code carries its exchange suffix.
+
+    Native MiniQMT XtOrder/XtTrade carry the full '600000.SH' form. Events from
+    an older server (or when the callback object exposes no exchange info) may
+    carry the bare 6-digit code; infer the suffix from the A-share code ranges
+    so consumers can key on the full form. Non-6-digit or already-suffixed
+    codes pass through unchanged.
+    """
+    text = str(code or "").strip().upper()
+    if "." in text or not (len(text) == 6 and text.isdigit()):
+        return text
+    if text.startswith(("600", "601", "603", "605", "688", "689")):
+        return text + ".SH"
+    if text.startswith(("000", "001", "002", "003", "300", "301")):
+        return text + ".SZ"
+    return text
 
 
 class BigQmtRpcClient:
@@ -458,6 +585,18 @@ class BigQmtRpcClient:
             if config_timeout is not None
             else _env_float("BIGQMT_RPC_TIMEOUT_SECONDS", 6.0)
         )
+        config_download_wait = client_config.get("download_wait_seconds")
+        self.download_wait_seconds = float(
+            config_download_wait
+            if config_download_wait is not None
+            else _env_float("BIGQMT_DOWNLOAD_WAIT_SECONDS", 1800.0)
+        )
+        config_download_poll = client_config.get("download_poll_interval_seconds")
+        self.download_poll_interval_seconds = float(
+            config_download_poll
+            if config_download_poll is not None
+            else _env_float("BIGQMT_DOWNLOAD_POLL_INTERVAL_SECONDS", 0.5)
+        )
         full_tick_cache_config = dict(client_config.get("full_tick_cache_config") or {})
         self.full_tick_cache_config = {
             "enabled": _bool_value(
@@ -485,9 +624,8 @@ class BigQmtRpcClient:
                 or _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2)
             ),
         }
-        # Client-side local market-data cache. download_history_data* pulls bars
-        # over RPC once and persists them here; get_local_data then reads them with
-        # no RPC. fallback_rpc=True lets get_local_data fetch+cache a cache miss.
+        # Client-side local market-data cache. get_market_data_ex is cache-through;
+        # fallback_rpc=True lets get_local_data fetch+cache a cache miss.
         local_cache_config = dict(client_config.get("local_cache_config") or {})
         self.local_cache_config = {
             "enabled": _bool_value(
@@ -654,6 +792,12 @@ class BigQmtRpcClient:
             _RPC_INFLIGHT.release()
         if not response.get("ok"):
             raise RuntimeError(response.get("error") or "Big QMT RPC failed: %s" % method)
+        # server_error 携带 QMT 端诊断（如 passorder 提交但委托没进系统）。
+        # 只在交易类方法上设置（读取类恒为空），转成异常让调用方看到真实原因，
+        # 而不是把「无委托号」误判为 -1 失败（issue #38）。
+        server_error = str(response.get("server_error") or "")
+        if server_error:
+            raise RuntimeError("Big QMT %s server_error: %s" % (method, server_error))
         return _restore_jsonable(response.get("data"))
 
     def publish_event(self, event_type, payload, stream_template="bigqmt:quote_events:{account_id}"):
@@ -772,7 +916,15 @@ class BigQmtXtData:
                 raise
         return self.client.call(method, params)
 
-    def get_full_tick(self, code_list):
+    def get_full_tick(self, code_list, timeout_seconds=None):
+        """Fetch full tick data for a list of codes.
+
+        Args:
+            code_list: stock codes to query.
+            timeout_seconds: per-request RPC timeout. None = auto (30s for whole-market
+                snapshots, else client default 120s). Callers can pass a larger value
+                when querying many codes (e.g. 1256 ETF options may need 150-180s).
+        """
         codes = list(code_list or [])
         if not codes:
             return {}
@@ -803,10 +955,15 @@ class BigQmtXtData:
                 raise TimeoutError("full tick redis cache timeout: %s" % ",".join(str(code) for code in codes))
             # Symbol-list miss (cold start / expired snapshot): fall back to a live
             # RPC so the first call is ~ms instead of a hard wait_seconds stall.
-            return self.client.call("get_full_tick", {"codes": codes}) or {}
+            rpc_timeout = timeout_seconds if timeout_seconds is not None else None
+            return self.client.call("get_full_tick", {"codes": codes}, timeout_seconds=rpc_timeout) or {}
         upper_codes = {str(code).strip().upper() for code in codes}
-        timeout_seconds = 30 if upper_codes & {"SH", "SZ", "BJ", "HK"} else None
-        return self.client.call("get_full_tick", {"codes": codes}, timeout_seconds=timeout_seconds) or {}
+        # Caller-provided timeout takes priority; otherwise auto-detect whole-market.
+        if timeout_seconds is not None:
+            rpc_timeout = timeout_seconds
+        else:
+            rpc_timeout = 30 if upper_codes & {"SH", "SZ", "BJ", "HK"} else None
+        return self.client.call("get_full_tick", {"codes": codes}, timeout_seconds=rpc_timeout) or {}
 
     def get_instrument_detail(self, stock_code):
         return self.client.call("get_instrument_detail", {"code": stock_code}) or {}
@@ -906,6 +1063,16 @@ class BigQmtXtData:
         self._check_bar_quality(data, context="get_market_data")
         return data
 
+    def _get_market_data_ex_batch(self, params, timeout_seconds=None):
+        """One RPC's worth of bars, healed and normalized. No caching."""
+        data = self._call("get_market_data_ex", timeout_seconds=timeout_seconds, **params)
+        # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
+        data = self._heal_adjusted("get_market_data_ex", params, data)
+        # Normalize Big QMT's stime-indexed frame to MiniQMT shape (time-indexed).
+        if isinstance(data, dict):
+            data = _normalize_market_data_result(data, field_list=params.get("field_list"))
+        return data
+
     def get_market_data_ex(
         self,
         field_list=None,
@@ -916,13 +1083,26 @@ class BigQmtXtData:
         count=-1,
         dividend_type="none",
         fill_data=True,
+        chunk_size=None,
+        timeout_seconds=None,
     ):
-        # Live pull over RPC. Cache-through: whatever we fetch is written to the
-        # local cache (keyed by dividend_type), so it stays the latest — important
-        # for 前复权 (front-adjusted) data, whose history re-scales on each dividend.
-        params = dict(
+        """Pull bars over RPC, in batches of ``chunk_size`` codes.
+
+        Cache-through: whatever is fetched is written to the local cache (keyed
+        by dividend_type), so it stays the latest -- important for 前复权 data,
+        whose history re-scales on each dividend.
+
+        Batching exists because one request carrying every code shares a single
+        RPC timeout (6s by default), so a wide stock_list times out and loses
+        the whole pull rather than degrading (issue #47). Splitting keeps each
+        request small enough to answer, and a batch that still fails only costs
+        its own codes -- the rest are returned.
+
+        ``chunk_size=0`` restores the old single-request behaviour.
+        """
+        codes = list(stock_list or [])
+        base = dict(
             field_list=list(field_list or []),
-            stock_list=list(stock_list or []),
             period=period,
             start_time=start_time,
             end_time=end_time,
@@ -930,12 +1110,40 @@ class BigQmtXtData:
             dividend_type=dividend_type,
             fill_data=fill_data,
         )
-        data = self._call("get_market_data_ex", **params)
-        # Self-heal adjusted reads (all-zero bars -> server raw download + retry).
-        data = self._heal_adjusted("get_market_data_ex", params, data)
+        step = DEFAULT_MARKET_DATA_CHUNK if chunk_size is None else int(chunk_size)
+
+        if step <= 0 or len(codes) <= step:
+            data = self._get_market_data_ex_batch(
+                dict(base, stock_list=codes), timeout_seconds=timeout_seconds
+            )
+        else:
+            data = {}
+            failures = []
+            for index in range(0, len(codes), step):
+                batch = codes[index:index + step]
+                try:
+                    part = self._get_market_data_ex_batch(
+                        dict(base, stock_list=batch), timeout_seconds=timeout_seconds
+                    )
+                except Exception as exc:
+                    # Losing one batch must not lose the others: a partial
+                    # result beats an exception when 500 codes were asked for.
+                    failures.append((batch, exc))
+                    continue
+                if isinstance(part, dict):
+                    data.update(part)
+            if failures and not data:
+                # Nothing came back at all -- surface the first cause rather
+                # than returning a silent empty dict.
+                raise failures[0][1]
+            for batch, exc in failures:
+                print("[bigqmt_client] get_market_data_ex batch failed (%d codes, first=%s): %s"
+                      % (len(batch), batch[0] if batch else "", exc))
+
         # Unified quality contract — record violations for monitoring.
         # Runs AFTER self-heal so we see the final quality, not intermediate.
         self._check_bar_quality(data, context="get_market_data_ex")
+
         cache = self._local_cache()
         if cache is not None and isinstance(data, dict):
             for code, df in data.items():
@@ -962,9 +1170,8 @@ class BigQmtXtData:
     ):
         """Read bars from the CLIENT-side local cache — no RPC to Big QMT.
 
-        Populate the cache first with download_history_data2(...). Returns a dict
-        {code: DataFrame}. A cache-missed code is omitted, unless
-        local_cache_fallback_rpc is enabled (then it is fetched + cached).
+        Returns a dict {code: DataFrame}. A cache-missed code is omitted, unless
+        local_cache_fallback_rpc is enabled (then it is fetched + cached over RPC).
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         cache = self._local_cache()
@@ -972,7 +1179,7 @@ class BigQmtXtData:
             # Cache disabled -> behave like a plain RPC local-data read.
             return self._call(
                 "get_local_data",
-                field_list=list(field_list or []),
+                field_list=_as_list(field_list),
                 stock_list=codes,
                 period=period,
                 start_time=start_time,
@@ -988,7 +1195,10 @@ class BigQmtXtData:
         for code in codes:
             df = cache.read(code, period, start_time, end_time, count, dividend_type=dividend_type)
             if df is not None and getattr(df, "shape", (0,))[0] > 0:
-                result[code] = self._select_fields(df, fields)
+                result[code] = self._select_fields(
+                    _normalize_market_data_frame(df, field_list=fields),
+                    fields,
+                )
             else:
                 missing.append(code)
         if missing and _bool_value(self.client.local_cache_config.get("fallback_rpc"), False):
@@ -996,7 +1206,10 @@ class BigQmtXtData:
             for code in missing:
                 df = fetched.get(code)
                 if df is not None and getattr(df, "shape", (0,))[0] > 0:
-                    result[code] = self._select_fields(df, fields)
+                    result[code] = self._select_fields(
+                        _normalize_market_data_frame(df, field_list=fields),
+                        fields,
+                    )
         return result
 
     @staticmethod
@@ -1004,7 +1217,7 @@ class BigQmtXtData:
         if not fields:
             return df
         try:
-            keep = [c for c in df.columns if c in fields or c in _TIME_COL_NAMES]
+            keep = [c for c in df.columns if c in fields or (c in _TIME_COL_NAMES and c != "stime")]
             return df[keep] if keep else df
         except Exception:
             return df
@@ -1641,7 +1854,7 @@ class BigQmtXtData:
                     break
         return result
 
-    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None):
+    def download_history_data2(self, stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0):
         """Pull bars from Big QMT over RPC and cache them locally, in batches.
 
         Mirrors xtdata.download_history_data2: after this, get_local_data(..., the
@@ -1653,10 +1866,14 @@ class BigQmtXtData:
         Server-side real download runs FIRST for ALL dividend types
         ([fix 2026-08-20 subscribe-cap-storm]): without it, the get loop below makes
         the QMT engine per-code SUBSCRIBE for local-store misses (ErrorID 210000
-        订阅超过上限 — see download_server_raw). Adjusted types additionally
-        require raw bars + dividend factors server-side (front-adjusted closes come
-        back all-zero otherwise, verified live), which the same download provides.
-        The pre-download is best-effort: on failure the get loop still runs.
+        订阅超过上限 — see download_server_raw). This also matches xtdata semantics
+        ("populate the local QMT store"): an unadjusted download used to skip the
+        server RPC and read only what Big QMT already had — a no-op that still
+        reported progress (issue #47).
+        Adjusted types additionally require raw bars + dividend factors server-side
+        (front-adjusted closes come back all-zero otherwise, verified live), which
+        the same download provides. The pre-download is best-effort: on failure the
+        get loop still runs.
         """
         codes = [str(c) for c in (stock_list or []) if str(c or "").strip()]
         if not codes:
@@ -1664,6 +1881,8 @@ class BigQmtXtData:
         if self._local_cache() is None:
             raise RuntimeError("local cache is disabled (set local_cache_enabled=True to download)")
 
+        # Server-side download first, for EVERY dividend_type (分块 + 双重熔断,
+        # 见 download_server_raw — 2026-08-20 subscribe-cap-storm 根治).
         self.download_server_raw(codes, period, start_time, end_time)
 
         total = len(codes)
@@ -2068,6 +2287,11 @@ class BigQmtXtTrader:
         self.callback = None
         self._event_thread = None
         self._event_running = False
+        # Async order submission (issue #50). One worker, started on first use,
+        # so a client that never calls order_stock_async pays nothing.
+        self._async_order_queue = _queue.Queue()
+        self._async_order_thread = None
+        self._async_order_lock = threading.Lock()
 
     def _cached_position_snapshot(self, account_id):
         key = "bigqmt:positions:%s" % str(account_id or self.client.account_id or "")
@@ -2164,7 +2388,7 @@ class BigQmtXtTrader:
                 )
             )
         except Exception:
-            pass
+            log.exception("user callback failed: on_account_status")
 
     def _event_loop(self):
         from .exec_events import (
@@ -2212,6 +2436,19 @@ class BigQmtXtTrader:
             return
         if not isinstance(event, dict):
             return
+        # 放行超时的屏障, 再决定这条事件是直通还是暂存 (issue #51)。
+        try:
+            self._sweep_order_barriers()
+            if event.get("event_type") in ("order", "trade") and self._hold_if_pending(event):
+                return
+        except Exception:
+            pass  # 屏障故障绝不能吞掉事件
+        self._deliver_event(event)
+
+    def _deliver_event(self, event):
+        callback = self.callback
+        if callback is None:
+            return
         account_id = str(event.get("account_id") or self.client.account_id or "")
         try:
             event_type = event.get("event_type")
@@ -2227,6 +2464,7 @@ class BigQmtXtTrader:
                         order_sys_id=event.get("order_sys_id") or "",
                         order_id=event.get("order_sys_id") or "",
                         stock_code=event.get("stock_code") or "",
+                        order_remark=str(event.get("remark") or event.get("user_order_id") or ""),
                     )
                 )
             elif event_type == "cancel_error":
@@ -2240,7 +2478,12 @@ class BigQmtXtTrader:
                     )
                 )
         except Exception:
-            pass
+            # 业务回调异常不能打崩事件线程，但必须留痕（issue: 静默吞错）。
+            log.exception(
+                "user callback failed: event_type=%s account=%s",
+                event.get("event_type"),
+                account_id,
+            )
 
     def run_forever(self):
         while True:
@@ -2285,6 +2528,40 @@ class BigQmtXtTrader:
             market_value=_safe_float(market_value, 0.0) if market_value is not None else 0.0,
         )
 
+    def _position_object(self, account_id, item):
+        volume = _safe_int(item.get("volume"))
+        available = _safe_int(item.get("available", item.get("can_use_volume")))
+        cost = _safe_float(item.get("cost", item.get("avg_price")))
+        price = _safe_float(item.get("price", item.get("last_price")), cost)
+        market_value = item.get("market_value")
+        if market_value is None:
+            market_value = price * volume
+        return CompatObject(
+            account_type=2,
+            account_id=account_id,
+            stock_code=str(item.get("stock_code") or ""),
+            stock_name=str(item.get("stock_name") or ""),
+            volume=volume,
+            can_use_volume=available,
+            enable_amount=available,
+            available_amount=available,
+            avg_price=cost,
+            price=price,
+            open_price=_safe_float(item.get("open_price"), cost),
+            cost_price=cost,
+            market_value=_safe_float(market_value, 0.0),
+            frozen_volume=_safe_int(item.get("frozen_volume")),
+            on_road_volume=_safe_int(item.get("on_road_volume")),
+            yesterday_volume=_safe_int(item.get("yesterday_volume"), volume),
+            direction=_safe_int(item.get("direction"), 48),
+        )
+
+    @staticmethod
+    def _position_items(data):
+        if isinstance(data, dict):
+            return list(data.values())
+        return _as_list(data)
+
     def query_stock_positions(self, account):
         account_id = _account_id(account, self.client.account_id)
         try:
@@ -2295,29 +2572,7 @@ class BigQmtXtTrader:
             data = self._cached_positions(account_id)
             if not data:
                 raise
-        positions = []
-        for item in _as_list(data):
-            stock_code = str(item.get("stock_code") or "")
-            volume = _safe_int(item.get("volume"))
-            available = _safe_int(item.get("available", item.get("can_use_volume")))
-            cost = _safe_float(item.get("cost", item.get("avg_price")))
-            positions.append(
-                CompatObject(
-                    account_id=account_id,
-                    stock_code=stock_code,
-                    stock_name=str(item.get("stock_name") or ""),
-                    volume=volume,
-                    can_use_volume=available,
-                    enable_amount=available,
-                    available_amount=available,
-                    avg_price=cost,
-                    price=cost,
-                    open_price=cost,
-                    cost_price=cost,
-                    yesterday_volume=_safe_int(item.get("yesterday_volume"), volume),
-                )
-            )
-        return positions
+        return [self._position_object(account_id, item) for item in self._position_items(data)]
 
     def query_stock_position(self, account, stock_code):
         account_id = _account_id(account, self.client.account_id)
@@ -2341,24 +2596,13 @@ class BigQmtXtTrader:
         if not data:
             return None
         return [
-            CompatObject(
-                account_id=account_id,
-                stock_code=str(item.get("stock_code") or ""),
-                stock_name=str(item.get("stock_name") or ""),
-                volume=_safe_int(item.get("volume")),
-                can_use_volume=_safe_int(item.get("available", item.get("can_use_volume"))),
-                enable_amount=_safe_int(item.get("available", item.get("can_use_volume"))),
-                available_amount=_safe_int(item.get("available", item.get("can_use_volume"))),
-                avg_price=_safe_float(item.get("cost", item.get("avg_price"))),
-                price=_safe_float(item.get("cost", item.get("avg_price"))),
-                open_price=_safe_float(item.get("cost", item.get("avg_price"))),
-                cost_price=_safe_float(item.get("cost", item.get("avg_price"))),
-                yesterday_volume=_safe_int(item.get("yesterday_volume"), _safe_int(item.get("volume"))),
-            )
+            self._position_object(account_id, item)
             for item in [data]
         ][0]
 
-    def query_stock_orders(self, account, cancelable_only=False, strategy_name="bigqmt_signal_trader"):
+    def query_stock_orders(self, account, cancelable_only=False, strategy_name=""):
+        # strategy_name 默认 ""（返回全部）：与服务端一致，避免下单用的策略名
+        # 与查询默认值不匹配导致委托查不到（strategy_name 陷阱）。
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_stock_orders",
@@ -2378,7 +2622,10 @@ class BigQmtXtTrader:
                 return order
         return None
 
-    def query_stock_trades(self, account, strategy_name="bigqmt_signal_trader"):
+    def query_stock_trades(self, account, strategy_name=""):
+        # 默认 "" = 查询账户全部成交 (与服务端 _handle_query_trades 一致)。
+        # 旧默认 "bigqmt_signal_trader" 会过滤掉其他策略名的成交;
+        # 按策略过滤时由调用方显式传入。
         account_id = _account_id(account, self.client.account_id)
         data = self.client.call(
             "query_stock_trades",
@@ -2440,35 +2687,179 @@ class BigQmtXtTrader:
 
     def order_stock_result(
         self, account, stock_code, order_type, order_volume, price_type,
-        price, strategy_name="", order_remark="",
+        price, strategy_name="", order_remark="", wait_settlement=True,
     ):
-        account_id = _account_id(account, self.client.account_id)
-        return self.client.call(
-            "order_stock",
-            {
-                "account_id": account_id,
-                "stock_code": stock_code,
-                "order_type": order_type,
-                "order_volume": order_volume,
-                "price_type": price_type,
-                "price": price,
-                "strategy_name": strategy_name,
-                "order_remark": order_remark,
-            },
-            account_id=account_id,
-        ) or {}
+        """Submit one order over RPC.
 
-    def order_stock_async(self, *args, **kwargs):
-        # MiniQMT semantics: returns a seq; the result comes back through
-        # on_order_stock_async_response(seq, order_error|None). Our RPC is
-        # synchronous under the hood, so we fire the response callback
-        # immediately with the seq and the submitted order.
-        seq = self._next_async_seq()
-        stock_code = str(kwargs.get("stock_code") or (args[1] if len(args) > 1 else ""))
+        ``wait_settlement=False`` tells the server to reply as soon as passorder
+        returns instead of holding the reply until QMT assigns the order id.
+        The async path uses it; the id then arrives through order_callback
+        (issue #50).
+        """
+        account_id = _account_id(account, self.client.account_id)
+        user_order_id = str(order_remark or "").strip()
+        if not user_order_id:
+            user_order_id = "bqrpc:%s:%s" % (int(time.time() * 1000), uuid.uuid4().hex[:10])
+        payload = {
+            "account_id": account_id,
+            "stock_code": stock_code,
+            "order_type": order_type,
+            "order_volume": order_volume,
+            "price_type": price_type,
+            "price": price,
+            "strategy_name": strategy_name,
+            "order_remark": user_order_id,
+        }
+        if not wait_settlement:
+            payload["wait_settlement"] = False
         try:
-            result = self.order_stock(*args, **kwargs)
+            return self.client.call("order_stock", payload, account_id=account_id) or {}
+        except TimeoutError as exc:
+            raise TimeoutError(
+                "order_stock rpc timeout; user_order_id=%s. Query orders/trades before retrying to avoid duplicate orders. %s"
+                % (user_order_id, exc)
+            )
+
+    def _async_order_worker(self):
+        """Drain queued async orders, one at a time.
+
+        A single worker rather than a pool: the server handles order RPCs on
+        the QMT adjust thread serially anyway, so concurrency here buys little,
+        while serializing keeps on_order_stock_async_response arriving in
+        submission order. For real batch throughput use order_stock_batch.
+        """
+        while True:
+            job = self._async_order_queue.get()
+            if job is None:          # shutdown sentinel
+                self._async_order_queue.task_done()
+                return
+            seq, args, kwargs = job
+            try:
+                self._run_async_order(seq, args, kwargs)
+            except Exception:
+                # A worker that dies takes every later async order with it.
+                pass
+            finally:
+                self._async_order_queue.task_done()
+
+    def _ensure_async_order_worker(self):
+        with self._async_order_lock:
+            if self._async_order_thread is not None and self._async_order_thread.is_alive():
+                return
+            thread = threading.Thread(
+                target=self._async_order_worker, name="bigqmt-async-order", daemon=True
+            )
+            self._async_order_thread = thread
+            thread.start()
+
+    # ------------------------------------------------------------------
+    # issue #51 A: 同一笔委托的 async_response 必须先于它的 order/trade 到达。
+    #
+    # 两条回调走的是不同线程和不同通道: async_response 在异步下单的工作线程上
+    # 触发, order/trade 来自 Redis pub/sub 监听线程。服务端在 order_callback
+    # 里先推事件再回 RPC, 所以顺序颠倒是常态而非偶发。
+    #
+    # 做法是给「已提交但尚未收到 async_response」的委托设一道屏障: 它的
+    # order/trade 事件先暂存, 等 response 触发后按到达顺序放行。延迟只加在
+    # 异步下单这一条路径上——手工下单、同步下单、以及任何未登记的委托一律直通。
+    # ------------------------------------------------------------------
+    ASYNC_BARRIER_TIMEOUT_SECONDS = 10.0
+
+    def _order_barrier(self):
+        barrier = getattr(self, "_async_barrier", None)
+        if barrier is None:
+            barrier = {}
+            self._async_barrier = barrier
+            self._async_barrier_lock = threading.Lock()
+        return barrier
+
+    @staticmethod
+    def _async_remark(args, kwargs):
+        """下单调用里的 order_remark —— 拿到 order_sys_id 之前唯一的关联键。"""
+        return str(kwargs.get("order_remark") or (args[7] if len(args) > 7 else "") or "")
+
+    def _arm_order_barrier(self, remark, seq):
+        """登记一笔待响应的委托。remark 为空则不设屏障(无从关联)。"""
+        if not remark:
+            return
+        self._order_barrier()
+        with self._async_barrier_lock:
+            # remark 不强制唯一(网格类策略常复用同一 remark)。同 remark 的上一笔
+            # 可能还扣着暂存事件, 直接覆盖会把它们永久丢掉——丢事件比顺序错乱
+            # 更糟, 所以接管旧 entry 并在锁外放行它的事件。
+            superseded = self._async_barrier.pop(remark, None)
+            self._async_barrier[remark] = {
+                "seq": seq,
+                "sys_ids": set(),
+                "events": [],
+                "deadline": time.time() + self.ASYNC_BARRIER_TIMEOUT_SECONDS,
+            }
+        for event in (superseded or {}).get("events", []):
+            self._deliver_event(event)
+
+    def _release_order_barrier(self, remark, seq=None):
+        """response 已触发, 按到达顺序放行暂存的事件。"""
+        if not remark:
+            return
+        self._order_barrier()
+        with self._async_barrier_lock:
+            entry = self._async_barrier.get(remark)
+            if entry is None:
+                return
+            if seq is not None and entry["seq"] != seq:
+                # 同 remark 的后一笔委托已接管屏障; 前一笔的 response 不该放它。
+                return
+            entry = self._async_barrier.pop(remark, None)
+        for event in (entry or {}).get("events", []):
+            self._deliver_event(event)
+
+    def _sweep_order_barriers(self):
+        """放行超时未收到 response 的委托。
+
+        没有这一步, 一次失败的提交会把它的事件永久扣住——丢事件比顺序错乱更糟。
+        """
+        now = time.time()
+        expired = []
+        with self._async_barrier_lock:
+            for remark, entry in list(self._async_barrier.items()):
+                if now >= entry["deadline"]:
+                    expired.append(self._async_barrier.pop(remark))
+        for entry in expired:
+            for event in entry.get("events", []):
+                self._deliver_event(event)
+
+    def _hold_if_pending(self, event):
+        """属于待响应委托则暂存并返回 True, 否则返回 False 直通。"""
+        barrier = self._order_barrier()
+        if not barrier:
+            return False
+        remark = str(event.get("remark") or event.get("user_order_id") or "")
+        sys_id = str(event.get("order_sys_id") or "")
+        with self._async_barrier_lock:
+            entry = barrier.get(remark) if remark else None
+            if entry is None and sys_id:
+                # 成交事件可能没有 remark; 用委托事件里学到的 order_sys_id 关联。
+                for candidate in barrier.values():
+                    if sys_id in candidate["sys_ids"]:
+                        entry = candidate
+                        break
+            if entry is None:
+                return False
+            if sys_id:
+                entry["sys_ids"].add(sys_id)
+            entry["events"].append(event)
+            return True
+
+    def _run_async_order(self, seq, args, kwargs):
+        """Do the actual submit and fire the matching callback. Worker thread."""
+        stock_code = str(kwargs.get("stock_code") or (args[1] if len(args) > 1 else ""))
+        remark = self._async_remark(args, kwargs)
+        callback = self.callback
+        try:
+            # wait_settlement=False: return as soon as passorder ran. The order
+            # id arrives via order_callback, which is what MiniQMT does too.
+            result = self.order_stock_result(*args, wait_settlement=False, **kwargs)
         except Exception as exc:
-            callback = self.callback
             if callback is not None:
                 try:
                     callback.on_order_error(
@@ -2478,19 +2869,27 @@ class BigQmtXtTrader:
                             order_sys_id="",
                             order_id="",
                             stock_code=stock_code,
+                            seq=seq,
+                            order_remark=str(kwargs.get("order_remark") or (args[7] if len(args) > 7 else "") or ""),
                         )
                     )
                 except Exception:
-                    pass
-            return seq
-        # MiniQMT: order_stock returns -1 when the order failed to submit.
-        # NOTE: the server also pushes an order_error event for 废单 (via
-        # exec_events), so a client may see this -1 error AND the server's
-        # order_error — they carry different info (RPC submit failure vs QMT
-        # rejection detail). We fire it only when the callback was registered,
-        # keeping both signals available to the client.
-        if isinstance(result, int) and result == -1:
-            callback = self.callback
+                    log.exception("user callback failed: on_order_error seq=%s", seq)
+            self._release_order_barrier(remark, seq)
+            return
+
+        order_sys_id = ""
+        user_order_id = ""
+        if isinstance(result, dict):
+            order_sys_id = str(result.get("order_sys_id") or result.get("order_sysid") or "")
+            user_order_id = str(result.get("user_order_id") or "")
+        elif result is not None:
+            order_sys_id = str(result)
+
+        # order_stock returns -1 when the submit itself failed. The server also
+        # pushes an order_error for a 废单; the two carry different information
+        # (RPC submit failure vs QMT rejection detail), so both stay available.
+        if order_sys_id == "-1" or result == -1:
             if callback is not None:
                 try:
                     callback.on_order_error(
@@ -2500,22 +2899,26 @@ class BigQmtXtTrader:
                             order_sys_id="",
                             order_id="",
                             stock_code=stock_code,
+                            seq=seq,
+                            order_remark=str(kwargs.get("order_remark") or (args[7] if len(args) > 7 else "") or ""),
                         )
                     )
                 except Exception:
-                    pass
-            return seq
-        callback = self.callback
+                    log.exception("user callback failed: on_order_error seq=%s", seq)
+            self._release_order_barrier(remark, seq)
+            return
+
         if callback is not None:
             try:
-                # Align with native XtOrderResponse: callback takes ONE arg
-                # (response) carrying account_id/order_id/seq/error_msg.
-                order_sys_id = str(result.get("order_sys_id") or result.get("order_sysid") or "") if isinstance(result, dict) else str(result)
+                # Native XtOrderResponse shape: one argument carrying
+                # account_id/order_id/seq/error_msg. order_id may be empty here
+                # -- the id is assigned asynchronously and lands in the
+                # order_callback push (issue #50).
                 callback.on_order_stock_async_response(
                     CompatObject(
                         account_id=self.client.account_id,
                         seq=seq,
-                        order_id=order_sys_id or str(result.get("user_order_id") or "") if isinstance(result, dict) else str(result),
+                        order_id=order_sys_id or user_order_id,
                         order_sys_id=order_sys_id,
                         stock_code=stock_code,
                         strategy_name=str(kwargs.get("strategy_name") or (args[6] if len(args) > 6 else "")),
@@ -2524,8 +2927,47 @@ class BigQmtXtTrader:
                     ),
                 )
             except Exception:
-                pass
+                log.exception(
+                    "user callback failed: on_order_stock_async_response seq=%s", seq
+                )
+        # response 已触发 -> 放行这笔委托暂存的 order/trade (issue #51)。
+        self._release_order_barrier(remark, seq)
+
+    def order_stock_async(self, *args, **kwargs):
+        """Queue an order and return its seq immediately (MiniQMT semantics).
+
+        This used to call order_stock inline, so it blocked for the full RPC
+        round trip plus -- after the issue #44 change -- however long the server
+        waited for QMT to assign an order id. That is 0.5-1s per order, which
+        defeats the point of an async API (issue #50).
+
+        Now the submit runs on a worker thread and the outcome arrives through
+        on_order_stock_async_response / on_order_error, both carrying the seq so
+        callers can correlate. Returns the seq without touching the network.
+        """
+        seq = self._next_async_seq()
+        # 屏障要在入队之前设好: 委托可能在本函数返回之前就被推送出来。
+        self._arm_order_barrier(self._async_remark(args, kwargs), seq)
+        self._ensure_async_order_worker()
+        self._async_order_queue.put((seq, args, kwargs))
         return seq
+
+    def wait_async_orders(self, timeout=10.0):
+        """Block until every queued async order has been submitted.
+
+        For tests and for shutdown; the API itself is fire-and-forget. Returns
+        False on timeout rather than hanging. Uses task_done bookkeeping, so it
+        waits for the in-flight job too, not merely for the queue to drain.
+        """
+        queue_obj = getattr(self, "_async_order_queue", None)
+        if queue_obj is None:
+            return True
+        deadline = time.time() + float(timeout)
+        while queue_obj.unfinished_tasks:
+            if time.time() > deadline:
+                return False
+            time.sleep(0.005)
+        return True
 
     def order_stock_batch(self, account, orders, batch_id=""):
         account_id = _account_id(account, self.client.account_id)
@@ -2650,7 +3092,10 @@ class BigQmtXtTrader:
             try:
                 callback(result)
             except Exception:
-                pass
+                log.exception(
+                    "user callback failed: %s",
+                    getattr(sync_call, "__name__", "async_query_callback"),
+                )
             return None
         return self._next_async_seq()
 
@@ -2714,7 +3159,7 @@ class BigQmtXtTrader:
             try:
                 callback(result)
             except Exception:
-                pass
+                log.exception("user callback failed: query_ipo_data_async")
             return None
         return self._next_async_seq()
 
@@ -2738,11 +3183,12 @@ class BigQmtXtTrader:
                             error_id=getattr(exc, "errno", 0),
                             error_msg=str(exc),
                             order_sys_id=str(order_id or ""),
+                            order_id=str(order_id or ""),
                             stock_code="",
                         )
                     )
                 except Exception:
-                    pass
+                    log.exception("user callback failed: on_cancel_error")
             return seq
         callback = self.callback
         if callback is not None:
@@ -2752,12 +3198,18 @@ class BigQmtXtTrader:
                         account_id=self.client.account_id,
                         seq=seq,
                         success=bool(ok),
+                        # MiniQMT XtCancelOrderResponse 契约: cancel_result=0 成功,
+                        # 失败时给出非零错误码和可读 error_msg。
+                        cancel_result=0 if ok else -1,
+                        error_msg="" if ok else "cancel_order_stock rejected by server",
                         order_sys_id=str(order_id or ""),
                         order_id=str(order_id or ""),
                     ),
                 )
             except Exception:
-                pass
+                log.exception(
+                    "user callback failed: on_cancel_order_stock_async_response seq=%s", seq
+                )
         return seq
 
     def cancel_order_stock_sysid_async(self, account, market, order_sysid):
@@ -2773,11 +3225,12 @@ class BigQmtXtTrader:
                             error_id=getattr(exc, "errno", 0),
                             error_msg=str(exc),
                             order_sys_id=str(order_sysid or ""),
+                            order_id=str(order_sysid or ""),
                             stock_code="",
                         )
                     )
                 except Exception:
-                    pass
+                    log.exception("user callback failed: on_cancel_error")
             return seq
         callback = self.callback
         if callback is not None:
@@ -2787,12 +3240,18 @@ class BigQmtXtTrader:
                         account_id=self.client.account_id,
                         seq=seq,
                         success=bool(ok),
+                        # MiniQMT XtCancelOrderResponse 契约: cancel_result=0 成功,
+                        # 失败时给出非零错误码和可读 error_msg。
+                        cancel_result=0 if ok else -1,
+                        error_msg="" if ok else "cancel_order_stock rejected by server",
                         order_sys_id=str(order_sysid or ""),
                         order_id=str(order_sysid or ""),
                     ),
                 )
             except Exception:
-                pass
+                log.exception(
+                    "user callback failed: on_cancel_order_stock_async_response seq=%s", seq
+                )
         return seq
 
     def set_relaxed_response_order_enabled(self, enabled=True):
@@ -2811,7 +3270,7 @@ class BigQmtXtTrader:
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or item.get("order_id") or "")
         return CompatObject(
             account_id=account_id,
-            stock_code=str(item.get("stock_code") or ""),
+            stock_code=_full_a_share_code(item.get("stock_code")),
             order_type=order_type,
             order_status=_safe_int(item.get("status", item.get("order_status")), ORDER_UNKNOWN),
             order_volume=_safe_int(item.get("volume", item.get("order_volume"))),
@@ -2821,6 +3280,12 @@ class BigQmtXtTrader:
             order_id=order_sysid or str(item.get("user_order_id") or ""),
             strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("remark") or item.get("user_order_id") or ""),
+            # MiniQMT XtOrder.order_time 是 Unix 秒。服务端订单事件只发
+            # created_at_ts 不发 order_time，所以没有显式 order_time 时
+            # 用 created_at_ts 兜底；两者都没有才落到 0（不要当成 1970 年）。
+            order_time=_safe_int(item.get("order_time") or item.get("created_at_ts"), 0),
+            # MiniQMT XtOrder.status_msg —— 废单时柜台给的原因 (issue #60)。
+            status_msg=str(item.get("status_msg") or ""),
         )
 
     def _trade_from_dict(self, account_id, item):
@@ -2828,16 +3293,31 @@ class BigQmtXtTrader:
         order_type = _action_to_order_type(action)
         order_sysid = str(item.get("order_sys_id") or item.get("order_sysid") or "")
         trade_id = str(item.get("trade_id") or "")
+        traded_volume = _safe_int(item.get("volume", item.get("traded_volume")))
+        traded_price = _safe_float(item.get("price", item.get("traded_price")))
+        amount = item.get("amount")
+        if not amount:
+            # 服务端未取到金额（缺失或 0）时按 价格 * 数量 估算，保证盈亏统计不为 0。
+            amount = traded_price * traded_volume
         return CompatObject(
             account_id=account_id,
-            stock_code=str(item.get("stock_code") or ""),
+            stock_code=_full_a_share_code(item.get("stock_code")),
             order_type=order_type,
             order_sysid=order_sysid,
             order_id=order_sysid,
             trade_id=trade_id,
-            traded_volume=_safe_int(item.get("volume", item.get("traded_volume"))),
-            traded_price=_safe_float(item.get("price", item.get("traded_price"))),
+            # MiniQMT 字段契约: traded_id/traded_time 是业务代码读取的名字。
+            traded_id=trade_id,
+            traded_volume=traded_volume,
+            traded_price=traded_price,
+            # 优先级: 服务端真实成交时间(traded_time) -> 事件到达时间(created_at_ts)
+            # -> traded_at 字符串解析。
+            traded_time=_to_unix_seconds(
+                item.get("traded_time") or item.get("created_at_ts") or item.get("traded_at")
+            ),
+            traded_amount=_safe_float(amount, 0.0),
             traded_at=str(item.get("traded_at") or ""),
+            strategy_name=str(item.get("strategy_name") or ""),
             order_remark=str(item.get("user_order_id") or item.get("remark") or ""),
         )
 

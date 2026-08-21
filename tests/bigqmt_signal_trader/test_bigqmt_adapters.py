@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import unittest
 
 
@@ -86,6 +87,46 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(context.instrument_codes, ["000001.SZ"])
         self.assertEqual(instrument["InstrumentStatus"], 0)
 
+    def test_get_ticks_keys_keep_the_caller_case_for_futures(self):
+        """issue #58: futures instrument codes are lower-case ('rb2708.SF'), but
+        the keys came back upper-cased, so `code in result` failed for every
+        futures code and the book looked missing."""
+        class EchoContext:
+            def __init__(self):
+                self.tick_codes = []
+
+            def get_full_tick(self, codes):
+                self.tick_codes.append(list(codes))
+                return dict((c, {"lastPrice": 1.0}) for c in codes)
+
+        context = EchoContext()
+        provider = BigQmtMarketDataProvider(context)
+
+        ticks = provider.get_ticks(["rb2708.SF", "a2609.DF"])
+
+        # QMT is still asked in upper case...
+        self.assertEqual(context.tick_codes, [["RB2708.SF", "A2609.DF"]])
+        # ...but the caller gets its own spelling back.
+        self.assertEqual(sorted(ticks), ["a2609.DF", "rb2708.SF"])
+
+    def test_get_ticks_still_completes_the_suffix(self):
+        """Only case is restored. Completing '600000' to '600000.SH' is useful
+        normalization that callers depend on, so it must survive."""
+        context = FakeContext()
+        provider = BigQmtMarketDataProvider(context)
+
+        self.assertIn("600000.SH", provider.get_ticks(["600000"]))
+
+    def test_get_ticks_passes_through_an_unrequested_key(self):
+        """Dropping a quote QMT volunteered would be worse than an odd key."""
+        class ExtraContext:
+            def get_full_tick(self, codes):
+                return {"RB2708.SF": {"lastPrice": 1.0}, "SURPRISE.SF": {"lastPrice": 2.0}}
+
+        ticks = BigQmtMarketDataProvider(ExtraContext()).get_ticks(["rb2708.SF"])
+
+        self.assertEqual(sorted(ticks), ["SURPRISE.SF", "rb2708.SF"])
+
     def test_market_provider_passes_market_codes_to_full_tick(self):
         context = FakeContext()
         provider = BigQmtMarketDataProvider(context)
@@ -129,6 +170,11 @@ class BigQmtAdaptersTest(unittest.TestCase):
                         m_nVolume=1000,
                         m_nCanUseVolume=800,
                         m_dOpenPrice=3.456,
+                        m_dLastPrice=3.789,
+                        m_dMarketValue=3789.0,
+                        m_nFrozenVolume=200,
+                        m_nOnRoadVolume=10,
+                        m_nYesterdayVolume=900,
                         m_strInstrumentName="ETF",
                     )
                 ]
@@ -141,6 +187,11 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(positions["510300.SH"].volume, 1000)
         self.assertEqual(positions["510300.SH"].available, 800)
         self.assertEqual(positions["510300.SH"].cost, 3.456)
+        self.assertEqual(positions["510300.SH"].price, 3.789)
+        self.assertEqual(positions["510300.SH"].market_value, 3789.0)
+        self.assertEqual(positions["510300.SH"].frozen_volume, 200)
+        self.assertEqual(positions["510300.SH"].on_road_volume, 10)
+        self.assertEqual(positions["510300.SH"].yesterday_volume, 900)
 
     def test_order_gateway_submit_uses_qmt_jq_trade_passorder_shape(self):
         calls = []
@@ -242,6 +293,40 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertEqual(trades[0].volume, 100)
         self.assertEqual(trades[0].price, 54.76)
 
+    def test_query_trades_reads_official_deal_amount_time_and_strategy(self):
+        # 官方文档 (dict.thinktrader.net data_structure): Deal 对象含
+        # m_dTradeAmount(成交额)、m_strTradeDate+m_strTradeTime(成交日期/时间)、
+        # m_strRemark(投资备注, 即 passorder 的 userOrderId)。
+        def fake_query(account, account_type, detail_type, strategy_name):
+            return [
+                Obj(
+                    m_strTradeID="t-1",
+                    m_strOrderSysID="sys-1",
+                    m_strInstrumentID="600000",
+                    m_strExchangeID="SH",
+                    m_nOffsetFlag=49,
+                    m_nVolume=100,
+                    m_dPrice=10.5,
+                    m_dTradeAmount=1055.55,
+                    m_strTradeDate="20260820",
+                    m_strTradeTime="100001",
+                    m_strRemark="rmk-1",
+                )
+            ]
+
+        gateway = BigQmtOrderGateway(
+            context_info=object(),
+            get_trade_detail_data_func=fake_query,
+        )
+
+        trades = gateway.query_trades_strict("acct", "strat-a")
+
+        self.assertEqual(trades[0].amount, 1055.55)
+        expected_ts = time.mktime(time.strptime("20260820100001", "%Y%m%d%H%M%S"))
+        self.assertEqual(trades[0].traded_time, int(expected_ts))
+        # 按策略名过滤时返回集必属该策略 (官方: strategyName 仅对委托/成交查询有效)
+        self.assertEqual(trades[0].strategy_name, "strat-a")
+
     def test_factory_bigqmt_mode_wires_real_adapters(self):
         app = build_app(
             FakeContext(),
@@ -261,5 +346,51 @@ class BigQmtAdaptersTest(unittest.TestCase):
         self.assertIsInstance(app.order_gateway, BigQmtOrderGateway)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class FinancialFieldTranslateTest(unittest.TestCase):
+    """Issue #52: MiniQMT table names must translate to Big QMT's dotted
+    "BIGTABLE.field" fieldList before calling ContextInfo.get_financial_data."""
+
+    def _provider(self):
+        calls = []
+
+        class _Ctx:
+            def get_financial_data(self, field_list, stock_list, start_date, end_date, report_type):
+                calls.append((field_list, stock_list, start_date, end_date, report_type))
+                return {}
+
+        return BigQmtMarketDataProvider(_Ctx()), calls
+
+    def test_miniqmt_table_name_expands_to_full_dotted_field_list(self):
+        provider, calls = self._provider()
+        provider.get_financial_data(["600000.SH"], ["Balance"], "20260101", "20260819")
+        field_list = calls[0][0]
+        self.assertEqual(calls[0][1], ["600000.SH"])  # stockList second
+        self.assertTrue(field_list)
+        self.assertTrue(all(f.startswith("ASHAREBALANCESHEET.") for f in field_list))
+        self.assertIn("ASHAREBALANCESHEET.tot_assets", field_list)
+        self.assertIn("ASHAREBALANCESHEET.tot_liab", field_list)
+
+    def test_bigqmt_bare_table_name_also_expands(self):
+        provider, calls = self._provider()
+        provider.get_financial_data(["600000.SH"], ["CAPITALSTRUCTURE"])
+        field_list = calls[0][0]
+        self.assertIn("CAPITALSTRUCTURE.total_capital", field_list)
+
+    def test_dotted_entries_remap_prefix_and_bigqmt_dots_pass_through(self):
+        provider, calls = self._provider()
+        provider.get_financial_data(["600000.SH"], [
+            "Balance.tot_assets",
+            "ASHAREINCOME.net_profit_incl_min_int_inc",
+        ])
+        field_list = calls[0][0]
+        self.assertEqual(field_list, [
+            "ASHAREBALANCESHEET.tot_assets",
+            "ASHAREINCOME.net_profit_incl_min_int_inc",
+        ])
+
+    def test_unknown_table_name_passes_through(self):
+        provider, calls = self._provider()
+        provider.get_financial_data(["600000.SH"], ["CustomTable"])
+        self.assertEqual(calls[0][0], ["CustomTable"])
+
+

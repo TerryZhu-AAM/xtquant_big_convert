@@ -14,6 +14,8 @@ dist/
 *.egg-info/
 
 # Local runtime secrets. Keep real account ids, Redis passwords and QMT paths out of git.
+# [merge 2026-08-22] 本地 4 行恢复未注释 — 上游 0.2.5 注释掉后仅剩 *.local.py,
+# 匹配不上 *_local_config.py (账户 ID/Redis 密码), git add -A 会漏提交密钥.
 bigqmt_signal_trader_local_config.py
 src/bigqmt_signal_trader_local_config.py
 bigqmt_signal_trader_client_config.py
@@ -25,3 +27,4 @@ src/bigqmt_signal_trader_client_config.py
 # Generated evidence from standalone/QMT backtest bridge runs.
 backtest_runs/
 qmt_backtest_runs/
+.workbuddy/

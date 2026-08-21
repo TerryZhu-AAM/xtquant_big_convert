@@ -85,19 +85,37 @@ def getDividFactors(*args, **kwargs):
 
 
 def submit_download_history_data(stock_code, period, start_time="", end_time="", incrementally=None):
-    return _compat.xtdata.submit_download_history_data(stock_code, period, start_time, end_time, incrementally)
+    # [fix 2026-08-22 merge-followup] 上游 0.2.5 原实现委托 _compat.xtdata.<同名方法>,
+    # 但 BigQmtXtData 无这些方法 (无 __getattr__) → 调用即 AttributeError. 改走
+    # call_method 通用 RPC 转发 (服务端 _handle_submit_download_history_data 契约:
+    # stock_code/period/start_time/end_time/incrementally).
+    return _compat.xtdata.call_method(
+        "submit_download_history_data",
+        stock_code=stock_code, period=period,
+        start_time=start_time, end_time=end_time, incrementally=incrementally,
+    )
 
 
 def submit_download_history_data2(stock_list, period, start_time="", end_time="", incrementally=None):
-    return _compat.xtdata.submit_download_history_data2(stock_list, period, start_time, end_time, incrementally)
+    return _compat.xtdata.call_method(
+        "submit_download_history_data2",
+        stock_list=list(stock_list or []), period=period,
+        start_time=start_time, end_time=end_time, incrementally=incrementally,
+    )
 
 
 def get_download_status(job_id):
-    return _compat.xtdata.get_download_status(job_id)
+    return _compat.xtdata.call_method("get_download_status", job_id=job_id)
 
 
 def wait_download(job_id, timeout=None, poll_interval=None, callback=None):
-    return _compat.xtdata.wait_download(job_id, timeout, poll_interval, callback)
+    # timeout→wait_seconds, poll_interval→poll_interval_seconds 对齐服务端 handler.
+    return _compat.xtdata.call_method(
+        "wait_download",
+        job_id=job_id,
+        wait_seconds=timeout,
+        poll_interval_seconds=poll_interval,
+    )
 
 
 def download_history_data(stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):

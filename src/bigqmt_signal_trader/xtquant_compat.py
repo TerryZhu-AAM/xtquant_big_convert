@@ -622,8 +622,11 @@ class BigQmtRpcClient:
         # 防主 loop 阻塞超 watchdog 阈值). FormulaServer fast path 已提前 return.
         _acquire_timeout = max(1.0, float(wait_seconds or 30) * 2)
         if not _RPC_INFLIGHT.acquire(timeout=_acquire_timeout):
+            # [trace 2026-08-21] 补 account_id + wall clock, 让 throttle 超时也能定位
+            # 是哪个 account / 何时触发 (8-11 启动期 RPC 风暴复盘关键证据).
             raise TimeoutError(
-                "bigqmt rpc concurrency throttle: %s (in-flight=%d)" % (method, _RPC_CONCURRENCY)
+                "bigqmt rpc concurrency throttle: %s (account=%s in-flight=%d t=%.3f)" %
+                (method, target_account, _RPC_CONCURRENCY, time.time())
             )
         try:
             transport = self._transport()
@@ -742,6 +745,31 @@ class BigQmtXtData:
         return self._cache_obj
 
     def _call(self, method, **params):
+        # [trace 2026-08-21 事故复盘] 统一咽喉打 ENTER/EXIT, 把 bridge 所有 read 方法
+        # 调用与 redis rpc timeout 对齐. 8-11/8-12 复盘发现仅 method 名的告警无法定位
+        # caller context (cron / call site / params). 默认关闭 (BIGQMT_TRACE=0) —
+        # 5788 只股票每次 bridge read 2 行 trace 会显著放大日志, 出问题时人工开.
+        # 与既有 [bigqmt_compat] / [bigqmt_formula] / [bigqmt_client] 前缀只增不替.
+        if os.environ.get("BIGQMT_TRACE") == "1":
+            _t0 = time.time()
+            _params_keys = ",".join(sorted(params.keys())) or "-"
+            print(
+                f"[bigqmt_trace] ENTER method={method} params=[{_params_keys}] t={_t0:.3f}",
+                flush=True,
+            )
+            try:
+                _r = self.client.call(method, params)
+                print(
+                    f"[bigqmt_trace] EXIT  method={method} ok=True  dt_ms={(time.time()-_t0)*1000:.1f}",
+                    flush=True,
+                )
+                return _r
+            except Exception as _e:
+                print(
+                    f"[bigqmt_trace] EXIT  method={method} ok=False err={type(_e).__name__}:{_e}  dt_ms={(time.time()-_t0)*1000:.1f}",
+                    flush=True,
+                )
+                raise
         return self.client.call(method, params)
 
     def get_full_tick(self, code_list):

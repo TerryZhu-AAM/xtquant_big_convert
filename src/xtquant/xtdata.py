@@ -5,16 +5,21 @@ def __getattr__(name):
     return getattr(_compat.xtdata, name)
 
 
-def get_full_tick(code_list):
-    return _compat.xtdata.get_full_tick(code_list)
+def get_full_tick(code_list, timeout_seconds=None):
+    # [compat v0.2.6] 增 timeout_seconds (单次 RPC 超时, 长代码列表分段时使用)
+    # 与 BigQmtXtData.get_full_tick 同款签名, ShimSignatureParityTest 全量锁.
+    return _compat.xtdata.get_full_tick(code_list, timeout_seconds)
 
 
 def get_market_data(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True):
     return _compat.xtdata.get_market_data(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data)
 
 
-def get_market_data_ex(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True):
-    return _compat.xtdata.get_market_data_ex(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data)
+def get_market_data_ex(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True, chunk_size=None, timeout_seconds=None):
+    # [compat v0.2.6] 增 chunk_size (分段大小, issue #47 RPC timeout 共享问题)
+    # + timeout_seconds (单批 RPC 超时), 与 BigQmtXtData.get_market_data_ex 同款签名.
+    # ShimSignatureParityTest 全量锁.
+    return _compat.xtdata.get_market_data_ex(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data, chunk_size, timeout_seconds)
 
 
 def get_local_data(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True, data_dir=None):
@@ -22,8 +27,12 @@ def get_local_data(field_list=[], stock_list=[], period="1d", start_time="", end
 
 
 def get_instrument_detail(stock_code, is_detail=False):
-    # is_detail: 对齐原生 xtquant 双参签名; 桥接路径不区分详细/简要,
-    # 接收并忽略, 避免原生双参调用抛 TypeError。
+    # [compat v0.2.6] compat 端收紧为单参 (移除 is_detail, 上游 RPC 协议本就不区分),
+    # 但 shim 端必须保留双参签名伪装原生 xtquant (调用方写
+    # ``get_instrument_detail(code, False)`` 是常见形态, 见 d430c15 8/20
+    # cnwuwil 提交 + test_xtdata_shim::test_get_instrument_detail_two_args_native_compatible).
+    # 与 ShimSignatureParityTest 的"known drift 白名单"对齐 (该锁强调
+    # "shim 不应比 compat 窄", 双参兼容恰是反向兼容, 已在白名单登记).
     return _compat.xtdata.get_instrument_detail(stock_code)
 
 
@@ -123,8 +132,11 @@ def download_history_data(stock_code, period, start_time="", end_time="", increm
     return _compat.xtdata.download_history_data(stock_code, period, start_time, end_time, incrementally, dividend_type)
 
 
-def download_history_data2(stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None):
-    return _compat.xtdata.download_history_data2(stock_list, period, start_time, end_time, callback, incrementally, dividend_type, chunk_size)
+def download_history_data2(stock_list, period, start_time="", end_time="", callback=None, incrementally=None, dividend_type="none", chunk_size=None, download_timeout_seconds=180.0, data_wait_seconds=60.0):
+    # [compat v0.2.6] 增加 download_timeout_seconds (单批服务端下载超时) + data_wait_seconds
+    # (下载后立读竞态轮询窗口, issue #66), 与 BigQmtXtData.download_history_data2 同款签名,
+    # ShimSignatureParityTest 全量锁.
+    return _compat.xtdata.download_history_data2(stock_list, period, start_time, end_time, callback, incrementally, dividend_type, chunk_size, download_timeout_seconds, data_wait_seconds)
 
 
 def get_trading_dates(market, start_time="", end_time="", count=-1):

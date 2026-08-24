@@ -36,6 +36,16 @@ from bigqmt_signal_trader.xtquant_compat import BigQmtRpcClient, BigQmtXtData  #
 class ShimSignatureParityTest(unittest.TestCase):
     """[review fix] shim wrappers must not be narrower than compat methods."""
 
+    # [compat v0.2.6 merge] 已知合理 drift 白名单:
+    # shim 与 compat 设计目标不同 — shim 伪装原生 xtquant 协议,
+    # compat 是 RPC bridge 真实实现. 以下白名单登记"shim 双参 / compat 单参"
+    # 的故意差异 (反向兼容原生 xtquant 调用范式, 而 compat RPC 不区分):
+    # - get_instrument_detail: shim 收 is_detail=False 兼容原生双参调用,
+    #   compat 只接 stock_code (RPC 协议本就不区分).
+    KNOWN_DRIFT = {
+        "get_instrument_detail": "shim 兼容原生 xtquant 双参 (code, is_detail), compat RPC 单参",
+    }
+
     def test_all_explicit_shim_wrappers_match_compat_signatures(self):
         compat_cls = BigQmtXtData
         drifted = []
@@ -44,6 +54,21 @@ class ShimSignatureParityTest(unittest.TestCase):
                 continue
             method = getattr(compat_cls, name, None)
             if method is None:
+                continue
+            if name in self.KNOWN_DRIFT:
+                # 白名单项: 验证 shim 是 compat 的超集 (shim 多收的参数都有默认值)
+                shim_params = list(inspect.signature(fn).parameters)
+                compat_params = list(inspect.signature(method).parameters)
+                if compat_params and compat_params[0] == "self":
+                    compat_params = compat_params[1:]
+                extra = [p for p in shim_params if p not in compat_params]
+                for p in extra:
+                    default = inspect.signature(fn).parameters[p].default
+                    if default is inspect.Parameter.empty:
+                        drifted.append(
+                            "%s: KNOWN_DRIFT 漂移参数 %s 无默认值, 必须默认兼容 (当前 default=%r)"
+                            % (name, p, default)
+                        )
                 continue
             shim_params = list(inspect.signature(fn).parameters)
             compat_params = list(inspect.signature(method).parameters)
@@ -98,9 +123,12 @@ class ShimSignatureParityTest(unittest.TestCase):
         class _FakeXtData:
             def download_history_data2(self, stock_list, period, start_time="",
                                        end_time="", callback=None, incrementally=None,
-                                       dividend_type="none", chunk_size=None):
+                                       dividend_type="none", chunk_size=None,
+                                       download_timeout_seconds=180.0, data_wait_seconds=60.0):
                 recorded["kwargs"] = dict(
-                    dividend_type=dividend_type, chunk_size=chunk_size
+                    dividend_type=dividend_type, chunk_size=chunk_size,
+                    download_timeout_seconds=download_timeout_seconds,
+                    data_wait_seconds=data_wait_seconds,
                 )
                 return {"finished": 0, "total": 0}
 
@@ -113,7 +141,13 @@ class ShimSignatureParityTest(unittest.TestCase):
         finally:
             xtdata_shim._compat.xtdata = orig
         self.assertEqual(
-            recorded["kwargs"], {"dividend_type": "front", "chunk_size": 10}
+            recorded["kwargs"],
+            {
+                "dividend_type": "front",
+                "chunk_size": 10,
+                "download_timeout_seconds": 180.0,
+                "data_wait_seconds": 60.0,
+            },
         )
 
 

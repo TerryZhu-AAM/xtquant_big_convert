@@ -37,7 +37,8 @@ class _FakeXtData:
 
     def download_history_data2(self, stock_list, period, start_time="", end_time="",
                                callback=None, incrementally=None, dividend_type="none",
-                               chunk_size=None, download_timeout_seconds=180.0):
+                               chunk_size=None, download_timeout_seconds=180.0,
+                               data_wait_seconds=60.0):
         self.calls.append((
             "download_history_data2",
             (tuple(stock_list), period, start_time, end_time, incrementally, dividend_type),

@@ -994,6 +994,26 @@ class BigQmtRpcHandlers:
                         settlement.result.order_sys_id = sysid
                     except Exception:
                         pass
+                    return True
+                # [fix BUG-20260826-bridge-empty-sysid-settle R4] The row landed
+                # but QMT has not assigned the order id yet. Settling now would
+                # reply with an empty order_sys_id, which the client maps to -1 =
+                # "rejected" -- while passorder already reached the counter (the
+                # 2026-08-26 double-write incident shape, e.g. the open-auction
+                # window). Treat it exactly like an early miss and keep waiting
+                # for the id until the deadline.
+                if not final:
+                    return False
+                message = (
+                    "order row found by remark but order_sys_id still empty after "
+                    "%d lookup(s) (stock=%s action=%s) — QMT accepted the order "
+                    "but has not assigned its id; the client must treat the "
+                    "missing id as outcome-unknown and re-verify by remark."
+                    % (settlement.attempts, request.stock_code, request.action)
+                )
+                settlement.server_error = message
+                if inline:
+                    self._last_server_error = message
                 return True
             if not final:
                 # Not there yet. QMT assigns the id asynchronously, so an early
@@ -1018,7 +1038,11 @@ class BigQmtRpcHandlers:
             return True
         except Exception:
             # A failed lookup must not lose the order -- it is already submitted.
-            return True
+            # [fix R4] A failed lookup before the deadline keeps retrying like an
+            # early miss; only at the deadline do we settle (the reply then goes
+            # out without a sysid and the client re-verifies by remark instead of
+            # misreading it as a rejection).
+            return bool(final)
 
     def _handle_submit_orders_batch(self, params):
         orders = params.get("orders") or []

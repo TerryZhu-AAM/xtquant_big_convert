@@ -9,10 +9,14 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
-from bigqmt_signal_trader.models import AssetSnapshot, OrderSnapshot, PositionSnapshot, TradeSnapshot
+from bigqmt_signal_trader.models import (
+    AssetSnapshot, OrderRequest, OrderSnapshot, OrderSubmitResult,
+    PositionSnapshot, TradeSnapshot,
+)
 from bigqmt_signal_trader.redis_rpc import (
     RPC_REVISION,
     BigQmtRpcHandlers,
+    OrderSettlement,
     RedisPubSubRpcService,
     decode_rpc_request_payload,
     encode_rpc_request_payload,
@@ -1181,6 +1185,106 @@ class DownloadHistoryDataTest(unittest.TestCase):
             ("000001.SZ", "1d", "20260815", "20260819"),
         ])
         self.assertTrue(result)
+
+
+class RowVisibleEmptySysidGateway(DryRunOrderGateway):
+    """[BUG-20260826-bridge-empty-sysid-settle R4] QMT opens the order row
+    immediately but assigns the order_sys_id only later (open-auction window /
+    busy counter). Before the fix, _apply_order_lookup settled on the first
+    remark hit even with an empty sysid — the client then mapped the missing id
+    to -1 = "rejected" while passorder had already reached the counter
+    (the 2026-08-26 double-write incident shape)."""
+
+    def __init__(self, assign_after=2, never=False):
+        super().__init__()
+        self.assign_after = assign_after
+        self.never = never
+        self.lookups = 0
+
+    def query_orders(self, account_id, strategy_name):
+        self.lookups += 1
+        sysid = "" if (self.never or self.lookups < self.assign_after) else "sysid-ok"
+        return [
+            OrderSnapshot(
+                order_sys_id=sysid,
+                user_order_id="dec-292a0e8d-s1",
+                stock_code="600036.SH",
+                action="BUY",
+                volume=12600,
+                traded_volume=0,
+                status="50",
+            )
+        ]
+
+
+class EmptySysidSettlementTest(unittest.TestCase):
+    """R4: a remark hit without a sysid must keep retrying until the deadline."""
+
+    def _handlers(self, gateway):
+        return BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+            allow_order_methods=True,
+            order_settle_timeout_seconds=0.0,
+        )
+
+    def _settlement(self):
+        request = OrderRequest(
+            signal_id="sig-1", account_id="acct", action="BUY",
+            stock_code="600036.SH", volume=12600, price=39.66,
+            price_type=11, strategy_name="cm", remark="dec-292a0e8d-s1",
+        )
+        result = OrderSubmitResult(
+            status="SUBMITTED", user_order_id="dec-292a0e8d-s1",
+        )
+        return OrderSettlement(request, result, 0.0)
+
+    def test_row_found_empty_sysid_not_settled_before_deadline(self):
+        gateway = RowVisibleEmptySysidGateway(assign_after=5)
+        handlers = self._handlers(gateway)
+        settlement = self._settlement()
+        self.assertFalse(handlers._apply_order_lookup(settlement, final=False))
+
+    def test_sysid_assigned_within_window_backfills(self):
+        gateway = RowVisibleEmptySysidGateway(assign_after=2)
+        handlers = self._handlers(gateway)
+        settlement = self._settlement()
+        self.assertFalse(handlers._apply_order_lookup(settlement, final=False))
+        self.assertTrue(handlers._apply_order_lookup(settlement, final=False))
+        self.assertEqual(settlement.result.order_sys_id, "sysid-ok")
+        self.assertEqual(settlement.server_error, "")
+
+    def test_deadline_with_row_but_no_sysid_uses_distinct_error(self):
+        gateway = RowVisibleEmptySysidGateway(never=True)
+        handlers = self._handlers(gateway)
+        settlement = self._settlement()
+        self.assertFalse(handlers._apply_order_lookup(settlement, final=False))
+        self.assertTrue(handlers._apply_order_lookup(settlement, final=True))
+        self.assertIn("found by remark", settlement.server_error)
+        self.assertNotIn("not found in system", settlement.server_error)
+        self.assertIsNone(settlement.result.order_sys_id)
+
+    def test_lookup_exception_retries_until_deadline(self):
+        class BrokenGateway(DryRunOrderGateway):
+            def query_orders(self, account_id, strategy_name):
+                raise ConnectionError("get_trade_detail_data failed")
+
+        handlers = self._handlers(BrokenGateway())
+        settlement = self._settlement()
+        self.assertFalse(handlers._apply_order_lookup(settlement, final=False))
+        self.assertTrue(handlers._apply_order_lookup(settlement, final=True))
+
+    def test_never_landed_deadline_message_unchanged(self):
+        class EmptyGateway(DryRunOrderGateway):
+            def query_orders(self, account_id, strategy_name):
+                return []
+
+        handlers = self._handlers(EmptyGateway())
+        settlement = self._settlement()
+        self.assertTrue(handlers._apply_order_lookup(settlement, final=True))
+        self.assertIn("not found in system", settlement.server_error)
 
 
 if __name__ == "__main__":

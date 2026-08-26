@@ -364,6 +364,37 @@ def _action_to_order_type(action):
     return 0
 
 
+# xtquant offset_flag 值域: 48=OFFSET_FLAG_OPEN(股票=买) / 49=OFFSET_FLAG_CLOSE(卖).
+# 与 app.domain.types.enums.XT_OFFSET_FLAG_BUY/SELL 同值 (23/24 是 order_stock 入参
+# 的 STOCK_BUY/SELL namespace, 切勿混用 — 见 qmt_gateway.query_stock_trades_all 注释).
+_OFFSET_FLAG_BUY = 48
+_OFFSET_FLAG_SELL = 49
+
+
+def _offset_flag_from_item(item, action):
+    """[fix 2026-08-26 state.trades 丢笔] 推导 offset_flag (48/49) 供网关方向映射.
+
+    背景: app 网关 query_stock_trades_all 读 XtTrade.offset_flag 判 BUY/SELL;
+    旧实现 CompatObject 不设该属性 → getattr 默认 None → OMS 启动重建
+    fail-CLOSED 跳过 (2026-08-26 09:36 两笔实成交被丢, state.trades/PG 台账双缺).
+    三源依次取: 服务端查询行只带 action 字符串; 事件行额外带原始
+    offset_flag/direction 整数. 全缺 → None (保持上游 fail-CLOSED, 不静默错记).
+    """
+    for key in ("offset_flag", "direction"):
+        raw = item.get(key)
+        if raw is None or raw == "":
+            continue
+        value = _safe_int(raw, -1)
+        if value in (_OFFSET_FLAG_BUY, _OFFSET_FLAG_SELL):
+            return value
+    text = str(action or "").upper()
+    if text == "BUY":
+        return _OFFSET_FLAG_BUY
+    if text == "SELL":
+        return _OFFSET_FLAG_SELL
+    return None
+
+
 def _safe_int(value, default=0):
     try:
         return int(value)
@@ -381,8 +412,11 @@ def _safe_float(value, default=0.0):
 def _to_unix_seconds(value, default=0):
     """Normalize a trade/order time into Unix seconds (MiniQMT semantics).
 
-    Accepts numeric epochs, ``YYYY-MM-DD HH:MM:SS[.ffffff]`` and
-    ``YYYYMMDDHHMMSS`` strings. Anything else falls back to ``default``.
+    Accepts numeric epochs, ``YYYY-MM-DD HH:MM:SS[.ffffff]``,
+    ``YYYYMMDDHHMMSS`` strings and — [fix 2026-08-26 state.trades 丢笔配套]
+    bare ``HHMMSS`` digit strings (大 QMT m_strTradeTime 形态, 如 "93631";
+    查询行只有时分秒无日期, 成交查询是当日口径 → 拼当天). Anything else
+    falls back to ``default``.
     """
     if value is None or value == "":
         return default
@@ -394,6 +428,14 @@ def _to_unix_seconds(value, default=0):
             return int(time.mktime(time.strptime(text, fmt)))
         except ValueError:
             continue
+    if text.isdigit() and len(text) <= 6:
+        try:
+            return int(time.mktime(_dt.datetime.combine(
+                _dt.date.today(),
+                _dt.datetime.strptime(text.zfill(6), "%H%M%S").time(),
+            ).timetuple()))
+        except ValueError:
+            pass
     return default
 
 
@@ -3431,6 +3473,9 @@ class BigQmtXtTrader:
             account_id=account_id,
             stock_code=_full_a_share_code(item.get("stock_code")),
             order_type=order_type,
+            # [fix 2026-08-26 state.trades 丢笔] 网关读 offset_flag(48/49)判 BUY/SELL,
+            # 缺失时 OMS 重建 fail-CLOSED 丢笔 — 三源推导见 _offset_flag_from_item.
+            offset_flag=_offset_flag_from_item(item, action),
             order_sysid=order_sysid,
             order_id=order_sysid,
             trade_id=trade_id,

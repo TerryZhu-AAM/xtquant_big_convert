@@ -114,6 +114,40 @@ class TradeObjectContractTest(unittest.TestCase):
         trade = trader._trade_from_dict("acct", self._trade_event(amount=None))
         self.assertEqual(trade.traded_amount, 1050.0)
 
+    # [fix 2026-08-26 state.trades 丢笔] offset_flag 契约: 网关 query_stock_trades_all
+    # 读 XtTrade.offset_flag (48=BUY/49=SELL) 映射方向, 缺失 → None → OMS 重建
+    # fail-CLOSED 跳过 (2026-08-26 09:36 两笔实成交被丢形态).
+    def test_trade_offset_flag_derived_from_action_when_raw_fields_missing(self):
+        trader = self._trader()
+        trade = trader._trade_from_dict("acct", self._trade_event())
+        self.assertEqual(trade.offset_flag, 48)
+
+    def test_trade_offset_flag_sell_action_maps_to_49(self):
+        trader = self._trader()
+        trade = trader._trade_from_dict("acct", self._trade_event(action="SELL"))
+        self.assertEqual(trade.offset_flag, 49)
+
+    def test_trade_offset_flag_prefers_raw_offset_flag_over_action(self):
+        trader = self._trader()
+        trade = trader._trade_from_dict(
+            "acct", self._trade_event(offset_flag=49, action="BUY")
+        )
+        self.assertEqual(trade.offset_flag, 49)
+
+    def test_trade_offset_flag_falls_back_to_direction(self):
+        trader = self._trader()
+        item = self._trade_event(direction=49)
+        item.pop("action", None)
+        trade = trader._trade_from_dict("acct", item)
+        self.assertEqual(trade.offset_flag, 49)
+
+    def test_trade_offset_flag_none_when_all_sources_missing(self):
+        trader = self._trader()
+        item = self._trade_event()
+        item.pop("action", None)
+        trade = trader._trade_from_dict("acct", item)
+        self.assertIsNone(trade.offset_flag)
+
     def test_trade_time_falls_back_to_traded_at_string(self):
         trader = self._trader()
         item = self._trade_event(created_at_ts=None)
@@ -128,6 +162,18 @@ class TradeObjectContractTest(unittest.TestCase):
         item = self._trade_event(created_at_ts=None, traded_at="")
         trade = trader._trade_from_dict("acct", item)
         self.assertEqual(trade.traded_time, 0)
+
+    def test_trade_time_hhmmss_string_combines_today(self):
+        # [fix 2026-08-26 state.trades 丢笔配套] 旧版服务端查询行只有 m_strTradeTime
+        # 形态 traded_at="93631" (HHMMSS, 前导零被剥) — 旧解析返 0 → 网关落
+        # 00:00:00 错时间. 现在 5-6 位纯数字串拼当天.
+        trader = self._trader()
+        item = self._trade_event(created_at_ts=None, traded_at="93631")
+        trade = trader._trade_from_dict("acct", item)
+        expected = int(_time.mktime(_time.strptime(
+            _time.strftime("%Y%m%d") + "093631", "%Y%m%d%H%M%S"
+        )))
+        self.assertEqual(trade.traded_time, expected)
 
     def test_order_time_prefers_order_time_field(self):
         trader = self._trader()

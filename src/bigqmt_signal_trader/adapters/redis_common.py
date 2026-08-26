@@ -1,5 +1,6 @@
 """Redis client helpers for Big QMT signal trader."""
 
+import inspect
 import os
 
 
@@ -12,6 +13,17 @@ def _float_or_none(value, default=None):
     if text.lower() in ("none", "null"):
         return None
     return float(value)
+
+
+def _redis_accepts_protocol(redis_module):
+    """[BUG-20260826-redis35-protocol-kwarg] QMT 终端内嵌 Python 捆绑 redis-py 3.5.3,
+    `Redis.__init__` 无 `protocol` 形参 (4.x 才引入), 传了即 TypeError 且桥接启动即崩.
+    特性检测: 仅新版 redis-py 传 protocol; 旧版只会 RESP2, 不传恰好等价强制 RESP2."""
+    try:
+        params = inspect.signature(redis_module.Redis.__init__).parameters
+    except (TypeError, ValueError):  # C 实现等取不到签名 → 按不支持处理
+        return False
+    return "protocol" in params
 
 
 def build_redis_client(config=None):
@@ -43,18 +55,20 @@ def build_redis_client(config=None):
     username = config.get("username") or os.environ.get("BIGQMT_REDIS_USERNAME") or None
     password = config.get("password") or os.environ.get("BIGQMT_REDIS_PASSWORD") or None
     # redis-py 8.x 默认 RESP3，Redis 5.0 只支持 RESP2 -> 强制 protocol=2
-    protocol = int(config.get("protocol") or os.environ.get("BIGQMT_REDIS_PROTOCOL") or 2)
-    return redis.Redis(
+    # (旧版 redis-py 无此形参, 见 _redis_accepts_protocol)
+    kwargs = dict(
         host=host,
         port=port,
         db=db,
         username=username,
         password=password,
-        protocol=protocol,
         socket_connect_timeout=_float_or_none(config.get("socket_connect_timeout", 1.5), 1.5),
         socket_timeout=_float_or_none(config.get("socket_timeout", 1.5), 1.5),
         health_check_interval=int(config.get("health_check_interval", 30)),
     )
+    if _redis_accepts_protocol(redis):
+        kwargs["protocol"] = int(config.get("protocol") or os.environ.get("BIGQMT_REDIS_PROTOCOL") or 2)
+    return redis.Redis(**kwargs)
 
 
 def decode_text(value):

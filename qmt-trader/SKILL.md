@@ -87,8 +87,14 @@ QMT 策略编辑器里**只加载运行 `BIGQMT_REDIS_DRYRUN.py` 一个文件**�
 ```powershell
 $env:BIGQMT_ACCOUNT_ID="资金账号"
 $env:BIGQMT_REDIS_HOST="Redis地址"; $env:BIGQMT_REDIS_PORT="6379"
-$env:BIGQMT_REDIS_DB="5"; $env:BIGQMT_REDIS_PASSWORD="Redis密码"
+$env:BIGQMT_REDIS_DB="0"; $env:BIGQMT_REDIS_PASSWORD="Redis密码"
 ```
+
+> ⚠️ db 双源纪律 (BUG-P0-20260810 + 2026-08-27 对抗复审 DEF-6): 生效优先级是
+> **配置文件 db > `BIGQMT_REDIS_DB` env > 兜底 5**; 本仓生产双端真实库 = **0**
+> (B 机本地配置文件钉 0, A 机 backend `.env` 钉 0)。变更 db 必须两端协同改,
+> 单端漂移 = RPC 无人消费的静默分裂。启动期 `[redis_common] build_redis_client
+> host=... db=...` 一行即为生效值留痕, 排障先看它。
 
 然后验证（redis ~13ms / zmq ~0.7ms 为正常）：
 

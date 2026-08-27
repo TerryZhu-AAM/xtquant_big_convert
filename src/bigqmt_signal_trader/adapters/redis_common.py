@@ -52,6 +52,10 @@ def build_redis_client(config=None):
     if _db_value is None or str(_db_value).strip() == "":
         _db_value = 5
     db = int(_db_value)
+    # [对抗复审 DEF-6] 启动期显式留痕生效库号 — A/B 两侧 db 来源不对称
+    # (QMT 端本地配置文件 vs backend .env env) 时, BUG-P0-20260810 式
+    # 跨库静默分裂可由这行日志一眼确诊。url 形态无此分支 (本仓生产未用)。
+    print("[redis_common] build_redis_client host=%s port=%s db=%d" % (host, port, db))
     username = config.get("username") or os.environ.get("BIGQMT_REDIS_USERNAME") or None
     password = config.get("password") or os.environ.get("BIGQMT_REDIS_PASSWORD") or None
     # redis-py 8.x 默认 RESP3，Redis 5.0 只支持 RESP2 -> 强制 protocol=2

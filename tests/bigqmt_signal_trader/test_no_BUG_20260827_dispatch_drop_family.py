@@ -130,5 +130,49 @@ class DbDefaultParityTests(unittest.TestCase):
         self.assertIn('_env_int("BIGQMT_REDIS_DB", 5)', compat)
 
 
+class DropStatsObservabilityTests(unittest.TestCase):
+    """[对抗复审 DEF-2 收口] 计数必须有出口: WARN 节流落日志 + facade 透传."""
+
+    def test_warn_emitted_every_20th_increment_with_snapshot(self):
+        from unittest import mock
+
+        x = BigQmtXtData(_MinimalClient())
+        with mock.patch("bigqmt_signal_trader.xtquant_compat.log") as fake_log:
+            for _ in range(19):
+                x._dispatch_quote_event("{not json")
+            fake_log.warning.assert_not_called()          # 阈值内静默 (热路径零 IO)
+            x._dispatch_quote_event("{not json")          # 第 20 次 → 触发
+            fake_log.warning.assert_called_once()
+            args = fake_log.warning.call_args[0]
+            self.assertIn("dispatch-drops", args[0])
+            snapshot = args[3]
+            self.assertEqual(snapshot["malformed_event"], 20)
+
+    def test_facade_passthrough_exists(self):
+        """shim facade 必须有同名透传 — 后端 getattr 守卫调用面."""
+        facade_path = os.path.join(ROOT, "src", "xtquant", "xtdata.py")
+        src = open(facade_path, encoding="utf-8").read()
+        self.assertIn("def get_dispatch_drop_stats", src)
+        self.assertIn("_compat.xtdata.get_dispatch_drop_stats()", src)
+        sys.path.insert(0, os.path.join(ROOT, "src"))
+        try:
+            import importlib
+            import xtquant.xtdata as facade  # noqa: import 已在仓内
+
+            importlib.reload(facade)
+            stats = facade.get_dispatch_drop_stats()
+            self.assertIsInstance(stats, dict)
+            self.assertIn("malformed_event", stats)
+        finally:
+            sys.path.remove(os.path.join(ROOT, "src"))
+
+    def test_redis_common_logs_effective_db_at_boot(self):
+        """[DEF-6] 启动期生效 db 留痕行在场 — A/B 双源不对称漂移可一眼确诊."""
+        redis_common = open(
+            os.path.join(ROOT, "src", "bigqmt_signal_trader", "adapters", "redis_common.py"),
+            encoding="utf-8").read()
+        self.assertIn("build_redis_client host=%s port=%s db=%d", redis_common)
+
+
 if __name__ == "__main__":
     unittest.main()

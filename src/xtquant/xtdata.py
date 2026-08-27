@@ -81,6 +81,15 @@ def unsubscribe_quote(seq_or_code, period=None):
     return _compat.xtdata.unsubscribe_quote(seq_or_code, period=period)
 
 
+def get_dispatch_drop_stats():
+    """[对抗复审 DEF-2 收口] 桥端路由丢弃计数快照透传.
+
+    native xtquant 无此函数 — 后端调用方必须 getattr 守卫 (与
+    set_quote_heartbeat_handler 同哲学)。
+    """
+    return _compat.xtdata.get_dispatch_drop_stats()
+
+
 def run():
     return _compat.xtdata.run()
 

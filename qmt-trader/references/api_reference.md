@@ -15,7 +15,7 @@
    | `BIGQMT_ACCOUNT_ID` | — | 资金账号 |
    | `BIGQMT_REDIS_HOST` | `127.0.0.1` | Redis 地址 |
    | `BIGQMT_REDIS_PORT` | `6379` | Redis 端口 |
-   | `BIGQMT_REDIS_DB` | `5` | Redis DB |
+   | `BIGQMT_REDIS_DB` | `5`(兜底) | Redis DB — 代码兜底值为 5, 本仓生产双端实际钉 **0** (B 机本地配置文件 / A 机 `.env`), 优先级 配置文件 > env > 兜底 |
    | `BIGQMT_REDIS_PASSWORD` | — | Redis 密码 |
    | `BIGQMT_RPC_TRANSPORT` | `redis` | 传输方式 redis/zmq |
    | `BIGQMT_RPC_TIMEOUT_SECONDS` | `6.0` | RPC 超时 |

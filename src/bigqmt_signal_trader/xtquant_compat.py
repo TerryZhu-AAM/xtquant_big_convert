@@ -1879,9 +1879,22 @@ class BigQmtXtData:
             return dict(self._dispatch_drops)
 
     def _bump_dispatch_drop(self, kind: str) -> None:
+        notify_at = 0
         with self._dispatch_drop_lock:
             if kind in self._dispatch_drops:
                 self._dispatch_drops[kind] += 1
+                notify_at = self._dispatch_drops[kind]
+        # [对抗复审 DEF-2 收口] INV-4 半程补齐: 计数不再只有"有人来读才有出口" —
+        # 每 20 次/类 经 log.warning 落一行累计快照 (bigqmt.log 持久化通道), 热路径
+        # 仅一次取模判断, 无额外 IO 直到触发。锁外取快照避免重入。
+        if notify_at and notify_at % 20 == 0:
+            try:
+                log.warning(
+                    "[BUG-20260827-dispatch-drops] kind=%s count=%d snapshot=%s",
+                    kind, notify_at, self.get_dispatch_drop_stats(),
+                )
+            except Exception:
+                pass  # 观测告警自身不许反噬派发线程
 
     def _write_keepalive(self, seq_str: str) -> None:
         """[BUG-20260827-sub-registry-gc] 消费端保活戳 (节流 60s/seq)。

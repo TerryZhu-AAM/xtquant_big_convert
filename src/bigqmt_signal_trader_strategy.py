@@ -89,10 +89,10 @@ _last_quote_bar_time = {}
 # interval_seconds 配置, 默认 30s ≈ dedup 静默期后端 staleness 容差(180s)的 1/6。
 _last_quote_heartbeat_at = {}
 _QUOTE_HEARTBEAT_INTERVAL_SEC = 30.0
-# [BUG-20260827-sub-registry-gc] INV-3 注册表卫生: 服务端被动发现账本 (seq→首见ms)
-# + 回收节流戳。env BIGQMT_QUOTE_SUB_GC=1 才启用 (默认关=零行为变更); 回收动作
-# 带 tombstone 审计, 回收清单同步清孤儿内存键。
-_quote_sub_observe_map = {}
+# [BUG-20260827-sub-registry-gc] INV-3 注册表卫生: 服务端回收节流戳。env
+# BIGQMT_QUOTE_SUB_GC=1 才启用 (默认关=零行为变更); 回收动作带 tombstone 审计,
+# 回收清单同步清孤儿内存键。[对抗复审 DEF-1 修复] 首见账本已持久化到 Redis
+# (quote_subs_firstseen), 进程内存 observe_map 删除 — 单源归 Redis, 泵重启不重置宽限。
 _last_sub_gc_run_ms = 0.0
 _SUB_GC_RUN_INTERVAL_SEC = 60.0
 _SUB_GC_KEEP_TTL_MS = 3 * 24 * 3600 * 1000   # 72h 无消费端活动才可回收
@@ -982,33 +982,43 @@ def _push_quote_updates(context_info, config):
     if not all_subs:
         return 0
 
-    # [BUG-20260827-sub-registry-gc] INV-3: 更新服务端被动发现账本 + 到期回收。
+    # [BUG-20260827-sub-registry-gc][对抗复审 DEF-1 修复] INV-3: 到期回收。
+    # 首见/保活账本全部持久化在 Redis (泵重启不再重置宽限起点); keep_ttl/grace
+    # 统一走 coerce_seconds_to_ms 强转 (字符串配置不再静默摆烂); 单周期回收量有
+    # cap 闸门 (全池级误收机制上不可能一拍发生, tombstone member=seq|code 可溯源)。
     global _last_sub_gc_run_ms
     _gc_now_ms = int(time.time() * 1000)
-    for seq_item, _code in all_subs:
-        _seq_str = str(seq_item)
-        if _seq_str not in _quote_sub_observe_map:
-            _quote_sub_observe_map[_seq_str] = _gc_now_ms
     if (
         _quote_sub_gc_enabled()
         and now - _last_sub_gc_run_ms >= _SUB_GC_RUN_INTERVAL_SEC
     ):
         _last_sub_gc_run_ms = now
         try:
-            from bigqmt_signal_trader.quote_events import reap_stale_subscriptions
+            from bigqmt_signal_trader.quote_events import (
+                coerce_seconds_to_ms,
+                reap_stale_subscriptions,
+            )
 
             _reap = reap_stale_subscriptions(
                 redis_client, account_id,
                 now_ms=_gc_now_ms,
-                keep_ttl_ms=int(quote_config.get("sub_gc_keep_ttl_sec", 0) * 1000) or _SUB_GC_KEEP_TTL_MS,
-                grace_ms=_SUB_GC_GRACE_MS,
-                observe_map=_quote_sub_observe_map,
+                keep_ttl_ms=coerce_seconds_to_ms(
+                    quote_config.get("sub_gc_keep_ttl_sec"),
+                    _SUB_GC_KEEP_TTL_MS / 1000.0,
+                ),
+                grace_ms=coerce_seconds_to_ms(
+                    quote_config.get("sub_gc_grace_sec"),
+                    _SUB_GC_GRACE_MS / 1000.0,
+                ),
                 enabled=True,
             )
             for _dead_seq in _reap.get("reaped", []):
                 # 孤儿内存键同步回收 (审计在 tombstone zset)
                 _last_quote_bar_time.pop(_dead_seq, None)
                 _last_quote_heartbeat_at.pop(_dead_seq, None)
+            if _reap.get("reaped") or _reap.get("deferred"):
+                print("[bigqmt_quote_events] sub gc reaped=%d deferred=%d"
+                      % (len(_reap.get("reaped", [])), _reap.get("deferred", 0)))
         except Exception as exc:
             print("[bigqmt_quote_events] sub gc failed: %s" % exc)
 

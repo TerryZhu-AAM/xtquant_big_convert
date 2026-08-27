@@ -938,27 +938,58 @@ class BigQmtRpcClient:
         callback → 持仓股卖出规则失明, BUG-20260813-quote-callback-seq-mismatch).
         2 retries = max 150ms block (50+100ms); 启动期批量 subscribe 500+ 票
         不会因 Redis 持续故障阻塞过久加剧 RPC 风暴.
+
+        [BUG-20260827-quote-sub-registry-silent-loss] hset 表面成功不等于落库成立
+        (ACK 后丢写 / 值残缺 / 主从切换丢键 = 000983.SZ 全天断流当日成因候选之一,
+         失败仅 print 且 stdout 被滚动覆盖 → 事后不可裁决)。因此每次 hset 后立即
+        hget 回读并按 JSON 语义比对; 不一致视同失败吃同一重试预算, 最终失败升级
+        log.error(持久化大QMT侧 bigqmt.log) + print(stdout) 双通道 — INV-4。
         """
         account_id = str(self.account_id or "")
         key = "bigqmt:quote_subscriptions:%s" % account_id
         redis_client = self._redis()
         if active:
             value = json.dumps(payload or {}, ensure_ascii=False, default=str)
+            stock_code = ""
+            try:
+                stock_code = str((payload or {}).get("stock_code", "") or "")
+            except Exception:
+                stock_code = "?"
             for _attempt in range(2):
                 try:
                     redis_client.hset(key, str(seq), value)
+                    raw_back = redis_client.hget(key, str(seq))
+                    back_text = (
+                        raw_back.decode("utf-8") if isinstance(raw_back, (bytes, bytearray)) else raw_back
+                    )
+                    if not back_text:
+                        raise RuntimeError(
+                            "readback miss: field %s absent right after hset" % seq
+                        )
+                    back_obj = json.loads(back_text)
+                    expected_obj = json.loads(value)
+                    if back_obj != expected_obj:
+                        raise RuntimeError(
+                            "readback mismatch: written payload differs from persisted value"
+                        )
                     return True
-                except Exception:
+                except Exception as exc:
                     if _attempt == 1:
-                        print("[bigqmt] save_quote_subscription hset failed 2x "
-                              "seq=%s code=%s" % (seq, (payload or {}).get("stock_code", "?")))
+                        log.error(
+                            "save_quote_subscription failed 2x seq=%s code=%s last_error=%s",
+                            seq, stock_code or "?", exc,
+                        )
+                        print("[bigqmt] save_quote_subscription failed 2x "
+                              "seq=%s code=%s last_error=%s" % (seq, stock_code or "?", exc))
                     time.sleep(0.05 * (_attempt + 1))
             return False
         else:
             try:
                 redis_client.hdel(key, str(seq))
-            except Exception:
-                pass
+            except Exception as exc:
+                # [BUG-20260827] 注销失败也不许全吞: 打点即可 (返 True 维持既有语义,
+                # 该路径无数据安全影响 — 条目多活一轮由 GC/清理兜底)。
+                log.warning("save_quote_subscription hdel failed seq=%s: %s", seq, exc)
             return True
 
 
@@ -1600,6 +1631,19 @@ class BigQmtXtData:
             "count": count,
         }
         _saved = self.client.save_quote_subscription(seq, payload, active=True)
+        # [BUG-20260827-quote-sub-registry-silent-loss] save 失败必须 fail-LOUD:
+        # 000983.SZ 实证 — save 静默 False + 后续无任何重试/对账 → 该码从注册表消失
+        # → 泵按哈希遍历永不推 → 全天断流且无人可裁决成因。现有唯一生产调用方
+        # (gateway_provider._subscribe_impl / admin_subscribe / etf_tick_router)
+        # 全部 per-code try/except 包裹: raise 后走 failed 列表 → 黑名单 TTL →
+        # TTL 过期差集补订, 由既有收敛回路自愈 — 而非"假成功后永久饿死"。
+        # 硬约束: raise 必须先于 _code_to_seq/_quote_callbacks/publish_event 快照 —
+        # 无哈希条目的 seq 不允许在客户端半状态中留孤儿。
+        if _saved is not True:
+            raise RuntimeError(
+                "save_quote_subscription failed seq=%s code=%s "
+                "(registry entry lost, caller must blacklist-and-retry)" % (seq, stock_code)
+            )
         # [BUG-P2-20260811-bridge-unsubscribe-quote-001] 反向索引 stock_code -> seq,
         # 无条件维护 (admin_subscribe 不传 callback 也写 Redis hash, admin_unsubscribe
         # 需反查 seq 清 hash). 放 callback 块外覆盖所有 subscribe 调用路径.

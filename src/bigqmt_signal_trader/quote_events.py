@@ -31,6 +31,29 @@ import time
 
 QUOTE_CHANNEL_TEMPLATE = "bigqmt:quote_events:{account_id}"
 EVENT_QUOTE = "quote"
+# [BUG-20260827-quote-heartbeat-frame] INV-2 活性与变化解耦: 封板/一字/极端缩量
+# 等"价格长期不变"形态下 pump 的按 close 去重会合法地静默 (600103.SH 2026-08-27
+# 全天封死 3.82 实测: 重启后首批 4 帧后再无一帧, 而 get_full_tick 数据恒新鲜),
+# 后端健康判定无法三分「断流/未订阅/无变化」。heartbeat 帧由 pump 对"在册但价格
+# 未变"的码周期性发布 (带 last_price), 走同一条 stream+pubsub 通道, 消费端
+# (xtquant_compat._dispatch_quote_event) 单独路由到 liveness 钩子, 绝不进入
+# OMS tick 链路 (零伪造行情面)。老 backend 收到未知 event_type 直接忽略
+# (既有 filter), 双端可非锁定序升级。
+EVENT_HEARTBEAT = "heartbeat"
+
+
+def heartbeat_interval_seconds_default():
+    return 30.0
+
+
+def should_send_heartbeat(last_sent_ts, now_ts, interval_seconds):
+    """纯函数判定心跳是否到期 (None=从未发过 → 立即到期)."""
+    interval = float(interval_seconds)
+    if interval <= 0:
+        return False
+    if last_sent_ts is None:
+        return True
+    return (float(now_ts) - float(last_sent_ts)) >= interval
 
 # Bar fields mirrored from get_market_data_ex / get_full_tick output. Names match
 # what gateway_provider._handle_xt_tick already consumes (close/open/high/low/
@@ -109,6 +132,23 @@ def normalize_quote_event(seq, stock_code, period, bar, account_id=""):
         "bidVol": fields["bidVol"],
         "askVol": fields["askVol"],
         "tickvol": fields["tickvol"],
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "created_at_ts": time.time(),
+    }
+
+
+def normalize_heartbeat_event(seq, stock_code, account_id="", last_price=None):
+    """[BUG-20260827] liveness-only 事件 — 不含 OHLCV bar 字段.
+
+    消费端把它当"最近推送尝试证明", 与 quote 帧严格区分 (绝不可混入 tick 链)。
+    """
+    return {
+        "event_type": EVENT_HEARTBEAT,
+        "seq": seq,
+        "account_id": str(account_id or ""),
+        "stock_code": str(stock_code or ""),
+        "period": "1m",
+        "last_price": last_price,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }

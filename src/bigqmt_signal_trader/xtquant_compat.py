@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Optional
 
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
+from .quote_events import EVENT_HEARTBEAT as _QUOTE_EVENT_HEARTBEAT
 from .redis_rpc import call_redis_rpc
 from .logging_setup import get_logger
 
@@ -1008,6 +1009,10 @@ class BigQmtXtData:
         # subscribe_quote 返回 seq 但 gateway_provider 不接 (调 subscribe_quote(code, ...,
         # callback) 丢弃返回值), 后续 unsubscribe_quote(code, period=) 需要反查 seq.
         self._code_to_seq = {}
+        # [BUG-20260827-quote-heartbeat-frame] liveness-only 事件独立钩子 — heartbeat
+        # 帧绝不进 _quote_callbacks/tick 链 (零伪造行情面), 只供观测层记录
+        # "最近推送尝试"。单 handler 槽位: 观测层 (gateway_provider) 订阅时注册。
+        self._quote_heartbeat_handler = None
         self._quote_event_thread = None
         self._quote_event_running = False
         # Unified bar quality contract — cumulative violation counts + throttled
@@ -1849,13 +1854,39 @@ class BigQmtXtData:
                 except Exception:
                     pass
 
+    def set_quote_heartbeat_handler(self, handler):
+        """[BUG-20260827-quote-heartbeat-frame] 注册 liveness 钩子 (传 None 注销).
+
+        handler 签名 ``handler(event: dict)`` — event 含 seq/stock_code/last_price/
+        created_at_ts。跑在 _quote_event_thread 上, handler 自己负责并发防护与
+        快速返回 (禁止 RPC / OMS 写)。
+        """
+        self._quote_heartbeat_handler = handler
+
+    def _dispatch_heartbeat_event(self, event):
+        """heartbeat → liveness 钩子; 无钩子/钩子异常一律静默 (观测通道不许反噬交易)."""
+        handler = self._quote_heartbeat_handler
+        if handler is None:
+            return
+        try:
+            handler(event)
+        except Exception as exc:
+            log.warning("quote heartbeat handler failed: %s", exc)
+
     def _dispatch_quote_event(self, raw):
         try:
             text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
             event = json.loads(text)
         except Exception:
             return
-        if not isinstance(event, dict) or event.get("event_type") != "quote":
+        if not isinstance(event, dict):
+            return
+        # [BUG-20260827-quote-heartbeat-frame] 心跳帧独立路由 — 与 quote 帧严格分流,
+        # 保证 liveness 观测永不污染 tick 数据面。
+        if event.get("event_type") == _QUOTE_EVENT_HEARTBEAT:
+            self._dispatch_heartbeat_event(event)
+            return
+        if event.get("event_type") != "quote":
             return
         seq = event.get("seq")
         callback = self._quote_callbacks.get(seq)

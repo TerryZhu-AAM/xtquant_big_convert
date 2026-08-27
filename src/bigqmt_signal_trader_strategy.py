@@ -81,6 +81,13 @@ _last_full_tick_market_refresh_at = 0.0
 # [seq]=last pushed close (dedup, 推送仅在价格变动时触发).
 _last_quote_push_at = 0.0
 _last_quote_bar_time = {}
+# [BUG-20260827-quote-heartbeat-frame] INV-2 活性与变化解耦: dedup 合法静默
+# (封板/一字/缩量) 时周期性发 heartbeat 帧, 让后端能三分「断流/未订阅/无变化」。
+# 键=seq (与 _last_quote_bar_time 同生命周期), 值=上次心跳 epoch 秒; 孤儿键由
+# 注册表 GC 同步回收 (quote_subs reap 路径)。间隔可由 quote_events.heartbeat_
+# interval_seconds 配置, 默认 30s ≈ dedup 静默期后端 staleness 容差(180s)的 1/6。
+_last_quote_heartbeat_at = {}
+_QUOTE_HEARTBEAT_INTERVAL_SEC = 30.0
 # Observed adjust cadence, so a mis-scheduled run_time (e.g. clamped to bar
 # cadence) is visible in the logs instead of silently costing latency.
 _adjust_tick_stats = {"last_ts": 0.0, "count": 0, "window_start": 0.0, "sum": 0.0, "min": 0.0, "max": 0.0}
@@ -910,6 +917,11 @@ def _push_quote_updates(context_info, config):
     if now - _last_quote_push_at < interval:
         return 0
     _last_quote_push_at = now
+    # [BUG-20260827-quote-heartbeat-frame] 心跳间隔配置化 (默认 30s)
+    hb_interval_sec = float(
+        quote_config.get("heartbeat_interval_seconds") or _QUOTE_HEARTBEAT_INTERVAL_SEC
+    )
+    now_ts = now
 
     redis_client = getattr(_rpc_service, "redis", None)
     if redis_client is None:
@@ -980,6 +992,26 @@ def _push_quote_updates(context_info, config):
                 continue
             bar_time = "tick_%.4f" % close_v
             if bar_time == _last_quote_bar_time.get(str(seq_val)):
+                # [BUG-20260827-quote-heartbeat-frame] 价格未变被去重合法跳过 ≠ 流死。
+                # 到期则发 liveness-only heartbeat 帧 (带 last_price), 消费端独立路由,
+                # 绝不进 OMS tick 链。失败仅记日志返回, 不拖垮本循环 (同 pump 契约)。
+                try:
+                    if quote_events.should_send_heartbeat(
+                        _last_quote_heartbeat_at.get(str(seq_val)),
+                        now_ts,
+                        hb_interval_sec,
+                    ):
+                        quote_events.publish_quote_event(
+                            redis_client,
+                            account_id,
+                            quote_events.normalize_heartbeat_event(
+                                seq=seq_val, stock_code=stock_code,
+                                account_id=account_id, last_price=close_v,
+                            ),
+                        )
+                        _last_quote_heartbeat_at[str(seq_val)] = now_ts
+                except Exception as exc:
+                    print("[bigqmt_quote_events] seq=%s heartbeat failed: %s" % (seq_val, exc))
                 continue
             row = {
                 "open": cell.get("open"),

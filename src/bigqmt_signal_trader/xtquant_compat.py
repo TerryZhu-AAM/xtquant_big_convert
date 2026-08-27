@@ -18,6 +18,7 @@ from typing import Any, Dict, Iterable, List, Optional
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .quote_events import EVENT_HEARTBEAT as _QUOTE_EVENT_HEARTBEAT
+from .quote_events import QUOTE_STREAM_MAXLEN as _QUOTE_STREAM_MAXLEN
 from .quote_events import (
     seen_key as _quote_seen_key,
     should_write_keepalive as _should_write_keepalive,
@@ -925,7 +926,7 @@ class BigQmtRpcClient:
         stream_key = stream_template.format(account_id=account_id)
         redis_client = self._redis()
         try:
-            redis_client.xadd(stream_key, {"payload": raw}, maxlen=1000, approximate=True)
+            redis_client.xadd(stream_key, {"payload": raw}, maxlen=_QUOTE_STREAM_MAXLEN, approximate=True)
         except Exception:
             pass
         try:
@@ -1020,6 +1021,17 @@ class BigQmtXtData:
         # [BUG-20260827-sub-registry-gc] 保活戳节流账本 (seq_str → last_written_ms):
         # dispatch 成功即代表消费端活 — 服务端 GC 据此判条目死活。
         self._keepalive_last_ms = {}
+        # [BUG-20260827-dispatch-drop-counters] INV-4: 路由层历史三处静默 return/pass
+        # (json 残缺 / 未知 event_type / seq miss 兜底不中 + 回调异常) — 全部给计数,
+        # get_dispatch_drop_stats() 快照给观测面, 阈值告警由消费方裁量。
+        self._dispatch_drop_lock = threading.Lock()
+        self._dispatch_drops = {
+            "malformed_event": 0,
+            "unknown_type": 0,
+            "seq_miss_no_fallback": 0,
+            "callback_exception": 0,
+            "empty_stock_code": 0,
+        }
         self._quote_event_thread = None
         self._quote_event_running = False
         # Unified bar quality contract — cumulative violation counts + throttled
@@ -1861,6 +1873,16 @@ class BigQmtXtData:
                 except Exception:
                     pass
 
+    def get_dispatch_drop_stats(self) -> dict:
+        """[BUG-20260827-dispatch-drop-counters] 丢弃计数快照 (线程安全拷贝)."""
+        with self._dispatch_drop_lock:
+            return dict(self._dispatch_drops)
+
+    def _bump_dispatch_drop(self, kind: str) -> None:
+        with self._dispatch_drop_lock:
+            if kind in self._dispatch_drops:
+                self._dispatch_drops[kind] += 1
+
     def _write_keepalive(self, seq_str: str) -> None:
         """[BUG-20260827-sub-registry-gc] 消费端保活戳 (节流 60s/seq)。
 
@@ -1903,8 +1925,10 @@ class BigQmtXtData:
             text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
             event = json.loads(text)
         except Exception:
+            self._bump_dispatch_drop("malformed_event")
             return
         if not isinstance(event, dict):
+            self._bump_dispatch_drop("malformed_event")
             return
         # [BUG-20260827-quote-heartbeat-frame] 心跳帧独立路由 — 与 quote 帧严格分流,
         # 保证 liveness 观测永不污染 tick 数据面。
@@ -1912,6 +1936,7 @@ class BigQmtXtData:
             self._dispatch_heartbeat_event(event)
             return
         if event.get("event_type") != "quote":
+            self._bump_dispatch_drop("unknown_type")
             return
         seq = event.get("seq")
         callback = self._quote_callbacks.get(seq)
@@ -1927,9 +1952,12 @@ class BigQmtXtData:
                 if _current_seq is not None and _current_seq != seq:
                     callback = self._quote_callbacks.get(_current_seq)
             if callback is None:
+                # [BUG-20260827-dispatch-drop-counters] 不再纯静默 — 计数留痕
+                self._bump_dispatch_drop("seq_miss_no_fallback")
                 return
         stock_code = str(event.get("stock_code") or "")
         if not stock_code:
+            self._bump_dispatch_drop("empty_stock_code")
             return
         bar = {
             "open": event.get("open"),
@@ -1961,7 +1989,7 @@ class BigQmtXtData:
             # [BUG-20260827-sub-registry-gc] 成功派发 = 消费端活, 节流写保活戳
             self._write_keepalive(str(seq or ""))
         except Exception:
-            pass
+            self._bump_dispatch_drop("callback_exception")
 
     def run(self):
         while True:

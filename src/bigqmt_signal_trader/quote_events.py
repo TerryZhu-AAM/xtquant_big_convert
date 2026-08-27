@@ -26,6 +26,7 @@ daemon (the example file 交易实时主推示例.py ships encrypted), so the
 adjust-pump is the lowest-risk real-time path.
 """
 import json
+import os
 import time
 
 
@@ -228,7 +229,15 @@ def normalize_heartbeat_event(seq, stock_code, account_id="", last_price=None):
     }
 
 
-def _publish(redis_client, channel, event, maxlen=2000):
+# [BUG-20260827-quote-stream-maxlen-unify] 客户端 publish_event 原 maxlen=1000 与
+# 服务端 _publish 2000 双写者不一致 → forensic 窗口由先触顶者决定。统一单一真相源
+# (env 可调), 两端默认一致。
+QUOTE_STREAM_MAXLEN = int(os.environ.get("BIGQMT_QUOTE_EVENT_MAXLEN", "2000"))
+
+
+def _publish(redis_client, channel, event, maxlen=None):
+    if maxlen is None:
+        maxlen = QUOTE_STREAM_MAXLEN
     raw = json.dumps(event, ensure_ascii=False, default=str)
     try:
         redis_client.xadd(channel, {"payload": raw}, maxlen=maxlen, approximate=True)

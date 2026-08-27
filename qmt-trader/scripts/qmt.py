@@ -610,7 +610,14 @@ def _place_order(args, action):
         )
     except Exception as e:
         _err("下单失败", detail=str(e), code="ORDER_FAIL")
-    if order_id == -1:
+    # [K3 2026-08-27 对抗审查] 桥 R4 后回包可能是数字串形态 sysid — 裸 '== -1'
+    # 对 '-1' 字符串恒假, 失败会被当成功放行。归一后再判负值; 非数字形态视为
+    # 结局未知不误报 (由下方 query_orders 对账兜底)。
+    try:
+        _order_id_int = int(str(order_id).strip())
+    except (TypeError, ValueError):
+        _order_id_int = None
+    if _order_id_int is not None and _order_id_int < 0:
         _err("下单返回 -1（失败），请检查：1) 账户权限 2) 价格范围 3) QMT 风控", code="ORDER_REJECTED")
     # 等 0.5 秒后查委托确认
     time.sleep(0.5)

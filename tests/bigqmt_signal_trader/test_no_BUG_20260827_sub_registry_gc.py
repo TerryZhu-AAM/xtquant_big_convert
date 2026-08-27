@@ -140,6 +140,24 @@ class StrategyCallSitePins(unittest.TestCase):
         self.assertIn("reap_stale_subscriptions", src)
         self.assertIn("_last_quote_bar_time.pop", src)   # 孤儿键同步回收
 
+    def test_strategy_imports_os_for_gc_gate(self):
+        """[对抗复审抓漏] GC 门用 os.environ — 模块顶部必须 import os.
+
+        py_compile 不查未绑定全局名; 缺 import os 会让泵首个周期 NameError
+        (被 adjust 外层宽捕获吞 → 行情推送全停)。AST 钉防回退。
+        """
+        import ast
+
+        path = os.path.join(ROOT, "src", "bigqmt_signal_trader_strategy.py")
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(a.name.split(".")[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported.add(node.module.split(".")[0])
+        self.assertIn("os", imported)
+
     def test_client_keeps_alive_on_dispatch(self):
         path = os.path.join(ROOT, "src", "bigqmt_signal_trader", "xtquant_compat.py")
         src = open(path, encoding="utf-8").read()

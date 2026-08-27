@@ -88,6 +88,18 @@ _last_quote_bar_time = {}
 # interval_seconds 配置, 默认 30s ≈ dedup 静默期后端 staleness 容差(180s)的 1/6。
 _last_quote_heartbeat_at = {}
 _QUOTE_HEARTBEAT_INTERVAL_SEC = 30.0
+# [BUG-20260827-sub-registry-gc] INV-3 注册表卫生: 服务端被动发现账本 (seq→首见ms)
+# + 回收节流戳。env BIGQMT_QUOTE_SUB_GC=1 才启用 (默认关=零行为变更); 回收动作
+# 带 tombstone 审计, 回收清单同步清孤儿内存键。
+_quote_sub_observe_map = {}
+_last_sub_gc_run_ms = 0.0
+_SUB_GC_RUN_INTERVAL_SEC = 60.0
+_SUB_GC_KEEP_TTL_MS = 3 * 24 * 3600 * 1000   # 72h 无消费端活动才可回收
+_SUB_GC_GRACE_MS = 3 * 24 * 3600 * 1000      # 服务端首次观测宽限期同 72h
+
+
+def _quote_sub_gc_enabled():
+    return os.environ.get("BIGQMT_QUOTE_SUB_GC", "0") == "1"
 # Observed adjust cadence, so a mis-scheduled run_time (e.g. clamped to bar
 # cadence) is visible in the logs instead of silently costing latency.
 _adjust_tick_stats = {"last_ts": 0.0, "count": 0, "window_start": 0.0, "sum": 0.0, "min": 0.0, "max": 0.0}
@@ -968,6 +980,36 @@ def _push_quote_updates(context_info, config):
             continue
     if not all_subs:
         return 0
+
+    # [BUG-20260827-sub-registry-gc] INV-3: 更新服务端被动发现账本 + 到期回收。
+    global _last_sub_gc_run_ms
+    _gc_now_ms = int(time.time() * 1000)
+    for seq_item, _code in all_subs:
+        _seq_str = str(seq_item)
+        if _seq_str not in _quote_sub_observe_map:
+            _quote_sub_observe_map[_seq_str] = _gc_now_ms
+    if (
+        _quote_sub_gc_enabled()
+        and now - _last_sub_gc_run_ms >= _SUB_GC_RUN_INTERVAL_SEC
+    ):
+        _last_sub_gc_run_ms = now
+        try:
+            from bigqmt_signal_trader.quote_events import reap_stale_subscriptions
+
+            _reap = reap_stale_subscriptions(
+                redis_client, account_id,
+                now_ms=_gc_now_ms,
+                keep_ttl_ms=int(quote_config.get("sub_gc_keep_ttl_sec", 0) * 1000) or _SUB_GC_KEEP_TTL_MS,
+                grace_ms=_SUB_GC_GRACE_MS,
+                observe_map=_quote_sub_observe_map,
+                enabled=True,
+            )
+            for _dead_seq in _reap.get("reaped", []):
+                # 孤儿内存键同步回收 (审计在 tombstone zset)
+                _last_quote_bar_time.pop(_dead_seq, None)
+                _last_quote_heartbeat_at.pop(_dead_seq, None)
+        except Exception as exc:
+            print("[bigqmt_quote_events] sub gc failed: %s" % exc)
 
     try:
         tick_data = context_info.get_full_tick([c for _, c in all_subs]) or {}

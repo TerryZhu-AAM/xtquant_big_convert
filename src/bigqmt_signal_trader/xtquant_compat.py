@@ -18,6 +18,10 @@ from typing import Any, Dict, Iterable, List, Optional
 from .full_tick_cache import request_full_tick_cache, wait_full_tick_cache
 from .local_cache import LocalMarketCache
 from .quote_events import EVENT_HEARTBEAT as _QUOTE_EVENT_HEARTBEAT
+from .quote_events import (
+    seen_key as _quote_seen_key,
+    should_write_keepalive as _should_write_keepalive,
+)
 from .redis_rpc import call_redis_rpc
 from .logging_setup import get_logger
 
@@ -1013,6 +1017,9 @@ class BigQmtXtData:
         # 帧绝不进 _quote_callbacks/tick 链 (零伪造行情面), 只供观测层记录
         # "最近推送尝试"。单 handler 槽位: 观测层 (gateway_provider) 订阅时注册。
         self._quote_heartbeat_handler = None
+        # [BUG-20260827-sub-registry-gc] 保活戳节流账本 (seq_str → last_written_ms):
+        # dispatch 成功即代表消费端活 — 服务端 GC 据此判条目死活。
+        self._keepalive_last_ms = {}
         self._quote_event_thread = None
         self._quote_event_running = False
         # Unified bar quality contract — cumulative violation counts + throttled
@@ -1854,6 +1861,23 @@ class BigQmtXtData:
                 except Exception:
                     pass
 
+    def _write_keepalive(self, seq_str: str) -> None:
+        """[BUG-20260827-sub-registry-gc] 消费端保活戳 (节流 60s/seq)。
+
+        写失败静默 — redis 故障时整个事件通道同样故障, 该路径不引入新故障面。
+        """
+        try:
+            now_ms = int(time.time() * 1000)
+            if not _should_write_keepalive(self._keepalive_last_ms.get(seq_str), now_ms):
+                return
+            account_id = str(self.client.account_id or "")
+            self.client._redis().hset(
+                _quote_seen_key(account_id), seq_str, str(now_ms)
+            )
+            self._keepalive_last_ms[seq_str] = now_ms
+        except Exception:
+            pass
+
     def set_quote_heartbeat_handler(self, handler):
         """[BUG-20260827-quote-heartbeat-frame] 注册 liveness 钩子 (传 None 注销).
 
@@ -1870,6 +1894,7 @@ class BigQmtXtData:
             return
         try:
             handler(event)
+            self._write_keepalive(str(event.get("seq") or ""))
         except Exception as exc:
             log.warning("quote heartbeat handler failed: %s", exc)
 
@@ -1933,6 +1958,8 @@ class BigQmtXtData:
         }
         try:
             callback({stock_code: [bar]})
+            # [BUG-20260827-sub-registry-gc] 成功派发 = 消费端活, 节流写保活戳
+            self._write_keepalive(str(seq or ""))
         except Exception:
             pass
 

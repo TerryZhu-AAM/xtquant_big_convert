@@ -5109,8 +5109,10 @@ class BigQmtXtTrader:
         code = _account_type_code((item or {}).get("account_type"))
         if code:
             return code
-        code = _account_type_code(self._server_account_type
-                                 or self._declared_account_type)
+        # [merge 2026-09-03] getattr 防御: __new__ 绕 init 的构造形态 (主仓端到端
+        # 测试/轻量宿主) 不带这两个属性 — 两者本就是可选线索, 缺失即落 SECURITY 兜底。
+        code = _account_type_code(getattr(self, "_server_account_type", None)
+                                 or getattr(self, "_declared_account_type", None))
         if code:
             return code
         try:

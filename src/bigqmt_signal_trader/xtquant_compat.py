@@ -1504,6 +1504,11 @@ class BigQmtXtData:
         # subscribe_quote 返回 seq 但 gateway_provider 不接 (调 subscribe_quote(code, ...,
         # callback) 丢弃返回值), 后续 unsubscribe_quote(code, period=) 需要反查 seq.
         self._code_to_seq = {}
+        # [BUG-20260903-sweep-keyspace] 本进程自写订阅 seq 账本 (str 口径) — save
+        # 成功即记, callback 有无都记。清扫豁免「本进程故意无 callback 的设计订阅」
+        # (常驻指数 subscribe_quote 两参形态, app/main.py subscribe_resident_index_codes),
+        # 只清跨进程残渣。seq 单调不回收, 集合只增 (订阅量级 ~1e2/日, 有界)。
+        self._self_seqs = set()
         # [BUG-20260827-quote-heartbeat-frame] liveness-only 事件独立钩子 — heartbeat
         # 帧绝不进 _quote_callbacks/tick 链 (零伪造行情面), 只供观测层记录
         # "最近推送尝试"。单 handler 槽位: 观测层 (gateway_provider) 订阅时注册。
@@ -2404,6 +2409,9 @@ class BigQmtXtData:
         # 无条件维护 (admin_subscribe 不传 callback 也写 Redis hash, admin_unsubscribe
         # 需反查 seq 清 hash). 放 callback 块外覆盖所有 subscribe 调用路径.
         self._code_to_seq[stock_code] = seq
+        # [BUG-20260903-sweep-keyspace] save 已确认成功 (fail-LOUD 先于此), hash 条目
+        # 必在场 — 记入自写账本供清扫豁免 (callback 形态不拘)。
+        self._self_seqs.add(str(seq))
         # [quote_events] 清同 code 旧 seq — 防订阅 hash 无限堆积 (每次重订阅新建 seq
         # 不清旧, 实测 498 条/15 code). pump 全量取会放大 Redis 写. hlen>50 才清摊销成本.
         # [2026-08-12 审查] 阈值 50 → 10: 88 条堆积实况 (600309×23/601899×22/603993×22
@@ -2413,7 +2421,10 @@ class BigQmtXtData:
         # [BUG-20260813-quote-callback-seq-mismatch] 仅在 _saved is True 时清旧 seq:
         # hset 失败时新 seq 没写进 hash, 清旧 seq 会导致该 code 在 hash 中完全消失
         # → QMT 不推 → callback 永远不触发 (持仓股卖出规则失明).
-        if _saved is True:
+        # [BUG-20260903-multiproc-sweep/BMG4-04] 同码清理是跨进程破坏性 hdel (会删
+        # 他人进程活跃 seq, 成功路径无日志) — 挂属主门: 属主进程行为不变, 非属主
+        # 进程 (测试/preflight) 不再清理, 其残渣由属主清扫按跨进程残渣清除。
+        if _saved is True and self._is_subscription_owner():
             try:
                 _redis = self.client._redis()
                 _sub_key = "bigqmt:quote_subscriptions:%s" % (self.client.account_id or "")
@@ -2611,14 +2622,18 @@ class BigQmtXtData:
         # 属主 = 后端主进程 (app/main.py setdefault 开)。
         self._arm_orphan_sweep()
 
-    def _arm_orphan_sweep(self) -> None:
-        """[BUG-20260903-multiproc-sweep] 武装一次性孤儿清扫 — 显式 env 门控, 默认关.
+    def _is_subscription_owner(self) -> bool:
+        """[BUG-20260903-multiproc-sweep] 订阅属主判定 — 清扫武装与同码清理共用一门.
 
-        只有「订阅唯一属主」进程 (后端主进程, 自设 BIGQMT_ORPHAN_SWEEP=1) 才允许
-        清扫: 判据「seq 不在本进程 callbacks」对任何并存进程都必然误删他人活跃
-        订阅, 故其余进程 (测试/preflight/工具) 保持不武装。
+        只有「订阅唯一属主」进程 (后端主进程, app/main.py setdefault 开) 才允许
+        做跨进程破坏性 hash 操作 (孤儿清扫 / hlen>10 同码清理): 非属主进程
+        (测试/preflight/工具) 的 callbacks 为空或不含他人 seq, 一律不武装。
         """
-        if not _bool_value(os.environ.get("BIGQMT_ORPHAN_SWEEP"), False):
+        return _bool_value(os.environ.get("BIGQMT_ORPHAN_SWEEP"), False)
+
+    def _arm_orphan_sweep(self) -> None:
+        """[BUG-20260903-multiproc-sweep] 武装一次性孤儿清扫 — 显式 env 门控, 默认关."""
+        if not self._is_subscription_owner():
             return
         try:
             _sweep_t = threading.Timer(
@@ -2632,11 +2647,13 @@ class BigQmtXtData:
     def _sweep_orphan_subscriptions(self) -> None:
         """[BUG-20260903-03] 一次性清理 hash 中无本进程回调的残留订阅条目.
 
-        判据: field(seq) not in _quote_callbacks = 本进程无消费者 — QMT pump 对这些
-        seq 的推送只会落 seq_miss_no_fallback 丢弃。清扫时点重验 (120s 延时窗内
-        迟到的新订阅已注册回调, 天然豁免); 订阅侧 seq 单调不回收, hgetall→hdel
-        窗口内新订阅只新增 field 不复用旧 seq, 无 TOCTOU 误删。多后端进程并存属
-        未支持部署形态 (单 uvicorn 判例), 跨进程保护不设防。
+        判据 (键空间归一后): field(seq) 不属于 {str(本进程 _quote_callbacks 键)}
+        与 {本进程 _self_seqs} 的并集 = 跨进程残渣 — QMT pump 对这些 seq 的推送
+        只会落 seq_miss_no_fallback 丢弃; 本进程在订 (callback 或设计性无
+        callback 的常驻指数) 一律豁免。清扫时点重验 (120s 延时窗内迟到的新订阅
+        已注册回调并入自写账本, 天然豁免); 订阅侧 seq 单调不回收, hgetall→hdel
+        窗口内新订阅只新增 field 不复用旧 seq, 无 TOCTOU 误删。属主门
+        (BIGQMT_ORPHAN_SWEEP) 保证只有唯一属主进程武装本清扫。
 
         [BUG-20260903-multiproc-sweep] 自动武装已收进 _arm_orphan_sweep 的
         BIGQMT_ORPHAN_SWEEP 显式门控 (默认关) — 本方法仍可显式直调 (测试/运维),
@@ -2646,10 +2663,19 @@ class BigQmtXtData:
             _redis = self.client._redis()
             _sub_key = "bigqmt:quote_subscriptions:%s" % (self.client.account_id or "")
             _fields = _redis.hgetall(_sub_key) or {}
+            # [BUG-20260903-sweep-keyspace] 判据键空间必须归一: _quote_callbacks 键
+            # 是内存 int seq (_next_seq), redis 回读 field 是 str — 直接 membership
+            # 永真, 属主进程会把自己的活跃订阅判成孤儿 (2026-09-03 19:04:58 实弹:
+            # 后端清扫删 64 条含自身在订 4 条 → tick 断供, WinSW out.log 铁证)。
+            # 统一以 str 比较; 另豁免本进程自写 seq (_self_seqs) — 常驻指数订阅
+            # 设计性无 callback, 不豁免则每次重启后 T+120s 被自删 → 大盘闸指数
+            # 1m 断流 (BMG4-01)。
+            _cb_seq_strs = {str(_s) for _s in self._quote_callbacks.keys()}
+            _self_written = {str(_s) for _s in getattr(self, "_self_seqs", ()) or ()}
             _orphans = []
             for _k in _fields.keys():
                 _seq = _k.decode() if isinstance(_k, (bytes, bytearray)) else str(_k)
-                if _seq not in self._quote_callbacks:
+                if _seq not in _cb_seq_strs and _seq not in _self_written:
                     _orphans.append(_seq)
             if _orphans:
                 _redis.hdel(_sub_key, *_orphans)

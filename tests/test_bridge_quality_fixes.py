@@ -384,6 +384,8 @@ class TestCriticalBareExceptFixes:
 
     def test_subscribe_quote_stale_cleanup_logs_failure(self):
         """subscribe_quote logs stale cleanup failure instead of silent pass."""
+        # [BMG4-04] 同码清理已挂属主门 (BIGQMT_ORPHAN_SWEEP) — 属主形态下
+        # 清理路径照旧可达, 本锁语义不变。
         # Mock successful subscription save (triggers cleanup path)
         self.bridge.client.save_quote_subscription = MagicMock(return_value=True)
         self.bridge.client.publish_event = MagicMock()
@@ -395,7 +397,8 @@ class TestCriticalBareExceptFixes:
         self.bridge.client._redis = MagicMock(return_value=mock_redis)
         self.bridge.client.account_id = "test_account"
 
-        with patch("builtins.print") as mock_print:
+        with patch("builtins.print") as mock_print, \
+                patch.dict("os.environ", {"BIGQMT_ORPHAN_SWEEP": "1"}):
             self.bridge.subscribe_quote("600519.SH")
 
             # Should have printed diagnostic

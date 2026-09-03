@@ -2275,10 +2275,11 @@ class BigQmtXtData:
         [merge 2026-09-03] 上游 0.3.x 同名函数为 retry-once 语义并带
         timeout_seconds 透传。裁决: 轮询骨架取本地 (P5/P6, 生产实证), 上游的
         timeout_seconds 透传并入 (其 get_market_data_ex 调用方传该 kwarg);
-        上游的 none-adjusted majority-missing 启发未并入 — 本地下载层
-        (download_history_data2 data_wait_seconds) 自带分批轮询, get 内再触发
-        服务端下载会双重轮询且把读路径放大成 10s 级 (本地
-        test_download_gives_up_after_wait_timeout 锁住该语义)。
+        上游的 none-adjusted majority-missing 自愈**已并入** (仅直读路径生效,
+        少数缺失不自愈 = 上游 #104 教训), 下载批循环内以 _download_batch_depth
+        护栏抑制 — 本地下载层 (download_history_data2 data_wait_seconds) 自带
+        分批轮询, get 内再触发服务端下载会双重轮询且把读路径放大成 10s 级
+        (本地 test_download_gives_up_after_wait_timeout 锁住该语义)。
         """
         dividend_type = str(params.get("dividend_type") or "none").lower()
         if dividend_type in ("", "none"):
@@ -2329,10 +2330,6 @@ class BigQmtXtData:
             def _healed(candidate):
                 return not self._is_all_zero_any(candidate)
 
-        # [P6 root-cause fix] Only re-download the codes that are actually
-        # all-zero, not the entire batch. For non-dict shapes, re-download all.
-        zero_codes = self._zero_codes_from_data(data)
-        target_codes = all_codes if "*" in zero_codes else zero_codes
         # Poll until the data lands or timeout. Each poll re-reads from the
         # server; the first non-zero result wins. The old single-shot retry
         # with a hard-coded sleep was a race against the server's async

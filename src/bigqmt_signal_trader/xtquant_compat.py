@@ -2605,6 +2605,21 @@ class BigQmtXtData:
         # [BUG-20260903-03] 首次起监听 (进程首个订阅) 后延时清扫跨进程残留订阅 —
         # hash 持久于 Redis, 重启后口径收缩时旧 seq 条目被 QMT pump 照推, 本进程
         # 无回调 → seq_miss 纯残渣噪音 (09-03 实弹 22.5k+/日)。
+        # [BUG-20260903-multiproc-sweep] 武装改显式门控 (默认关): 测试/preflight 进程
+        # 同样经真 .env 构造桥客户端, 无门控时其空 callbacks 会把后端活跃订阅当孤儿
+        # hdel (09-03 实弹: 19:03 后端 4 条订阅被静默清空 → tick 断供)。唯一合法
+        # 属主 = 后端主进程 (app/main.py setdefault 开)。
+        self._arm_orphan_sweep()
+
+    def _arm_orphan_sweep(self) -> None:
+        """[BUG-20260903-multiproc-sweep] 武装一次性孤儿清扫 — 显式 env 门控, 默认关.
+
+        只有「订阅唯一属主」进程 (后端主进程, 自设 BIGQMT_ORPHAN_SWEEP=1) 才允许
+        清扫: 判据「seq 不在本进程 callbacks」对任何并存进程都必然误删他人活跃
+        订阅, 故其余进程 (测试/preflight/工具) 保持不武装。
+        """
+        if not _bool_value(os.environ.get("BIGQMT_ORPHAN_SWEEP"), False):
+            return
         try:
             _sweep_t = threading.Timer(
                 120.0, self._sweep_orphan_subscriptions,
@@ -2622,6 +2637,10 @@ class BigQmtXtData:
         迟到的新订阅已注册回调, 天然豁免); 订阅侧 seq 单调不回收, hgetall→hdel
         窗口内新订阅只新增 field 不复用旧 seq, 无 TOCTOU 误删。多后端进程并存属
         未支持部署形态 (单 uvicorn 判例), 跨进程保护不设防。
+
+        [BUG-20260903-multiproc-sweep] 自动武装已收进 _arm_orphan_sweep 的
+        BIGQMT_ORPHAN_SWEEP 显式门控 (默认关) — 本方法仍可显式直调 (测试/运维),
+        但只有后端主进程会自动触发, 防并存进程把他人活跃订阅当孤儿清除。
         """
         try:
             _redis = self.client._redis()

@@ -1568,6 +1568,37 @@ class RedisPubSubRpcService:
             "server_error": "",
             "handled_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
+        # [fix 2026-09-01 ghost-execution] 过期请求丢弃 (双保险之消费端半):
+        # 客户端 timeout_seconds (默认 6s) 超时后早已按异常/拒单处置 (冻结释放、
+        # 标记可重试), ttl_seconds (默认 60s) 之后才被本端取到的请求执行结果无人
+        # 认领 — 09-01 实锤: 桥挂死期间积压的卖单在桥复活后被补执行 (系统侧已判
+        # 拒单的委托真实成交, 幽灵单). 无 ts 的旧版客户端请求跳过检查 (滚动部署
+        # 兼容); 响应照常发布 (ok=False), 便于事后审计.
+        _req_ts = request.get("ts")
+        _req_ttl = request.get("ttl_seconds")
+        if _req_ts is not None and _req_ttl is not None:
+            try:
+                _age = time.time() - float(_req_ts)
+                if _age > float(_req_ttl):
+                    response["error"] = (
+                        "stale request discarded: age=%.0fs > ttl=%.0fs "
+                        "(client timed out long ago; executing would ghost-fire)"
+                        % (_age, float(_req_ttl))
+                    )
+                    self._stale_discarded_count = getattr(self, "_stale_discarded_count", 0) + 1
+                    try:
+                        print("%s DISCARDED stale request method=%s age=%.0fs (ttl=%.0fs) total=%s"
+                              % (self.print_prefix, method, _age, float(_req_ttl),
+                                 self._stale_discarded_count))
+                    except Exception:
+                        pass
+                    try:
+                        self._publish_response(request, response)
+                    except Exception:
+                        pass
+                    return response
+            except (TypeError, ValueError):
+                pass  # ts/ttl 不可解析 → 按无时间戳处理, 不丢弃
         try:
             if self.account_id and account_id and account_id != self.account_id:
                 raise PermissionError("account_id mismatch")
@@ -1711,6 +1742,10 @@ def call_redis_rpc(
         "reply_list": response_list,
         "reply_key": response_key,
         "ttl_seconds": ttl_seconds,
+        # [fix 2026-09-01 ghost-execution] 入队时刻: 消费端按 ttl_seconds 丢弃过期
+        # 请求 (客户端 6s 超时早已放弃, 迟到的执行 = 无人认领的幽灵单). 旧版客户端
+        # 无 ts → 消费端跳过检查 (滚动部署兼容).
+        "ts": time.time(),
     }
     payload = encode_rpc_request_payload(request)
     if str(transport or "queue").lower() in ("queue", "list", "blpop"):
@@ -1741,6 +1776,15 @@ def call_redis_rpc(
         raw_response = redis_client.get(response_key)
         if raw_response:
             return json.loads(decode_text(raw_response))
+        # [fix 2026-09-01 ghost-execution] 超时即出队 (best-effort LREM):
+        # 旧语义超时后请求仍留在队列 → 桥复活/恢复消费时补执行 = 幽灵成交
+        # (09-01 实锤: 13:33 两笔清仓卖单超时被判拒单, 请求在队列存活至 13:39
+        # 桥重启被真执行). 回执缺失 ≠ 拒单 的另一半仍在: 请求可能已被消费端取走
+        # 正在执行, LREM 取不回 — 重试前仍必须按 remark 回查柜台定性.
+        try:
+            redis_client.lrem(request_queue, 1, payload)
+        except Exception:
+            pass  # best-effort: redis 不可达时放弃出队, 不改变超时语义
         raise TimeoutError(
             "redis rpc timeout: %s account_id=%s request_queue=%s" % (method, account_id, request_queue)
         )

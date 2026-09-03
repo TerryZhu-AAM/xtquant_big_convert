@@ -269,11 +269,18 @@ class BarSubscriptionTest(unittest.TestCase):
         self.assertEqual(data.stop_all_subscriptions(), 0)
 
 
-@unittest.skip("[merge 2026-09-03 裁决] subscribe_quote 采用本地 quote_events 生产通路 (Redis hash 泵 + seq 路由 + save fail-LOUD), 上游 0.3.x 的 whole-quote session / _BarPoller 轮询引擎未采用; 本组锁定的是未采用引擎的内部行为 — 引擎本体保留 (subscribe_whole_quote 仍走 session), 引擎路径若未来启用再解跳。")
 class BookkeepingTest(unittest.TestCase):
-    def test_a_redis_failure_does_not_break_the_subscription(self):
-        """Bookkeeping needs a Redis client; a zmq deployment has none, and
-        nothing on the server consumes these events anyway."""
+    def test_a_redis_failure_raises_instead_of_silently_subscribing(self):
+        """本地 fail-LOUD 契约 (BUG-20260827): save_quote_subscription 失败必须 raise。
+
+        [merge 2026-09-03 裁决 - BMG1-05 重锚] 上游同面试图断言「redis 故障不破坏订阅」
+        (redis 容错放水): 其背景是上游 whole-quote session/_BarPoller 引擎, 交付不经
+        Redis hash (msg 经发布订阅直推, 无订阅注册表). 本地生产通路经 Redis hash 注册表
+        驱动 QMT adjust pump, save 失败 = 注册表缺失该码 → 泵永不推 → 若静默成功则
+        全天断流且无人可裁决. 故本地语义必须 fail-LOUD (raise), 走调用方黑名单重试回路.
+        原测试断言「redis 失败仍 subscribe 成功 & 进 session.active」与本地契约相反,
+        应 assertRaises 而非 assertIn。
+        """
         class _Hostile(FakeClient):
             def save_quote_subscription(self, seq, payload, active=True):
                 raise RuntimeError("no redis here")
@@ -284,10 +291,12 @@ class BookkeepingTest(unittest.TestCase):
         session = FakeSession()
         data = _xtdata(_Hostile(), session)
 
-        seq = data.subscribe_quote("600000.SH", period="tick")
+        with self.assertRaises(RuntimeError):
+            data.subscribe_quote("600000.SH", period="tick")
 
-        self.assertIn(seq, session.active)
-        self.assertEqual(data.unsubscribe_quote(seq), 0)
+        # raise 必须早于任何客户端半状态 (反向索引/回调表): 失败订阅不残留孤儿 seq。
+        self.assertNotIn("600000.SH", data._code_to_seq)
+
 
 
 if __name__ == "__main__":

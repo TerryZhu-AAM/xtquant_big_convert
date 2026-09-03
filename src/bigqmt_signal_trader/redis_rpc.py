@@ -2436,6 +2436,16 @@ class RedisPubSubRpcService:
                     except Exception:
                         pass
                     try:
+                        # [BMG4-05] ghost 丢弃计数外置 redis — 此前仅内存自增 + pump
+                        # 控制台 print, 后端告警面永远看不到 09-01 事故签名发生过。
+                        # 失败静默: 观测面不得反噬丢弃主路径。
+                        self.redis.incr(
+                            "bigqmt:rpc:stale_discarded:%s"
+                            % (getattr(self, "account_id", "") or "")
+                        )
+                    except Exception:
+                        pass
+                    try:
                         self._publish_response(request, response)
                     except Exception:
                         pass

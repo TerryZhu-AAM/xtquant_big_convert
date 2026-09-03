@@ -69,6 +69,10 @@ class FakeResponseRedis:
         self.published.append((channel, value))
         return 1
 
+    def incr(self, key):
+        self.kv[key] = int(self.kv.get(key, 0)) + 1
+        return self.kv[key]
+
 
 class LremAwareQueueRedis:
     """call_redis_rpc 的 queue 传输面: rpush/expire/get/lrem。"""
@@ -147,6 +151,29 @@ class GhostExecutionServerSideTest(unittest.TestCase):
         # 丢弃回应照发, 供事后审计。
         self.assertTrue(
             any("stale request discarded" in str(v) for v in redis_client.kv.values())
+        )
+
+    def test_stale_discard_increments_redis_counter(self):
+        """[BMG4-05] ghost 丢弃必须外置 redis 计数 — 09-01 事故签名对后端可见.
+
+        红证 (修前): _stale_discarded_count 仅服务端内存自增 + 控制台 print,
+        后端告警面 (redis) 永远看不到 ghost 丢弃发生过。
+        """
+        gateway = CountingGateway()
+        redis_client, service = self._service(gateway)
+
+        service.process_request(
+            self._order_request(ts=time.time() - 999, ttl_seconds=60)
+        )
+        service.process_request(
+            self._order_request(ts=time.time() - 999, ttl_seconds=60)
+        )
+
+        counter_key = "bigqmt:rpc:stale_discarded:acct"
+        self.assertEqual(
+            redis_client.kv.get(counter_key), 2,
+            "stale 丢弃必须 INCR bigqmt:rpc:stale_discarded:{account} — "
+            "仅控制台 print 时后端无法观测 ghost 丢弃 (09-01 事故签名)",
         )
 
     def test_fresh_request_executes_normally(self):

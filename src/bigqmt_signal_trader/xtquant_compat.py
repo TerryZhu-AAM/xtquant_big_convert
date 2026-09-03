@@ -2989,44 +2989,49 @@ class BigQmtXtData:
         # _heal_adjusted): 下载层自持节奏 (data_wait_seconds), get 内不得再
         # 触发服务端下载造成双重轮询。
         self._download_batch_depth = getattr(self, "_download_batch_depth", 0) + 1
-        for i in range(0, total, step):
-            batch = codes[i:i + step]
-            # QMT 的下载全局是「提交任务即返回」，数据在服务端异步落地
-            # （秒~分钟级）。下载后立刻读只能看到旧数据——issue #66 里
-            #「tick 只能获得最近 1 天」的真正原因就是这个竞态：数据还没落地
-            # 就已经被读走并缓存了空结果。这里分批轮询，直到批内每个代码都
-            # 出现真实数据行或超时（超时容忍停牌/退市等确实无数据的代码）。
-            deadline = time.time() + float(data_wait_seconds)
-            while True:
-                # get_market_data_ex 是 cache-through：每次轮询都会写入缓存，
-                # 最后一次（数据齐或超时）的结果即最终缓存内容。
-                data = self.get_market_data_ex(
-                    field_list=DEFAULT_DOWNLOAD_FIELDS,
-                    stock_list=batch,
-                    period=period,
-                    start_time=start_time,
-                    end_time=end_time,
-                    count=-1,
-                    dividend_type=dividend_type,
-                    fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
-                    timeout_seconds=float(data_wait_seconds),
-                )
-                ready = 0
+        # [BMG1-01 2026-09-03] try/finally 兜住重入计数: 批循环内 get_market_data_ex
+        # 是 RPC 调用可抛异常 (超时/断连), 旧实现无 finally → 计数器泄漏为永久正数 →
+        # _heal_adjusted none-read majority-missing 自愈 (2290 判 >0 即 return) 被持续抑制。
+        try:
+            for i in range(0, total, step):
+                batch = codes[i:i + step]
+                # QMT 的下载全局是「提交任务即返回」，数据在服务端异步落地
+                # （秒~分钟级）。下载后立刻读只能看到旧数据——issue #66 里
+                #「tick 只能获得最近 1 天」的真正原因就是这个竞态：数据还没落地
+                # 就已经被读走并缓存了空结果。这里分批轮询，直到批内每个代码都
+                # 出现真实数据行或超时（超时容忍停牌/退市等确实无数据的代码）。
+                deadline = time.time() + float(data_wait_seconds)
+                while True:
+                    # get_market_data_ex 是 cache-through：每次轮询都会写入缓存，
+                    # 最后一次（数据齐或超时）的结果即最终缓存内容。
+                    data = self.get_market_data_ex(
+                        field_list=DEFAULT_DOWNLOAD_FIELDS,
+                        stock_list=batch,
+                        period=period,
+                        start_time=start_time,
+                        end_time=end_time,
+                        count=-1,
+                        dividend_type=dividend_type,
+                        fill_data=False,  # fill 会用全 0 占位行冒充数据，轮询判定必须关掉
+                        timeout_seconds=float(data_wait_seconds),
+                    )
+                    ready = 0
+                    for code in batch:
+                        df = (data or {}).get(code)
+                        if df is not None and getattr(df, "shape", (0,))[0] > 0:
+                            ready += 1
+                    if ready >= len(batch) or time.time() >= deadline:
+                        break
+                    time.sleep(1.5)
                 for code in batch:
-                    df = (data or {}).get(code)
-                    if df is not None and getattr(df, "shape", (0,))[0] > 0:
-                        ready += 1
-                if ready >= len(batch) or time.time() >= deadline:
-                    break
-                time.sleep(1.5)
-            for code in batch:
-                finished += 1
-                if callback is not None:
-                    try:
-                        callback({"finished": finished, "total": total, "stockcode": code})
-                    except Exception:
-                        pass
-        self._download_batch_depth -= 1
+                    finished += 1
+                    if callback is not None:
+                        try:
+                            callback({"finished": finished, "total": total, "stockcode": code})
+                        except Exception:
+                            pass
+        finally:
+            self._download_batch_depth -= 1
         return {"finished": finished, "total": total}
 
     def download_history_data(self, stock_code, period, start_time="", end_time="", incrementally=None, dividend_type="none"):

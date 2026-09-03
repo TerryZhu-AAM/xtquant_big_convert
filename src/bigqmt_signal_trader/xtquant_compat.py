@@ -2411,7 +2411,10 @@ class BigQmtXtData:
         self._code_to_seq[stock_code] = seq
         # [BUG-20260903-sweep-keyspace] save 已确认成功 (fail-LOUD 先于此), hash 条目
         # 必在场 — 记入自写账本供清扫豁免 (callback 形态不拘)。
-        self._self_seqs.add(str(seq))
+        # [F-03] __new__ 宿主 (主仓轻量测试/瘦客户端) 绕过 __init__, 此处防御自愈 —
+        # 与 _sweep_orphan_subscriptions 的 getattr 兜底同约定 (4b3f72d 判例:
+        # compat 不得假设 __init__ 属性在场)。
+        self.__dict__.setdefault("_self_seqs", set()).add(str(seq))
         # [quote_events] 清同 code 旧 seq — 防订阅 hash 无限堆积 (每次重订阅新建 seq
         # 不清旧, 实测 498 条/15 code). pump 全量取会放大 Redis 写. hlen>50 才清摊销成本.
         # [2026-08-12 审查] 阈值 50 → 10: 88 条堆积实况 (600309×23/601899×22/603993×22

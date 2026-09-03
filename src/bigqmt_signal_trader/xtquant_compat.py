@@ -828,6 +828,10 @@ class BigQmtRpcClient:
                     "method": method,
                     "params": params or {},
                     "ttl_seconds": 60,
+                    # [fix 2026-09-01 GHX1-03] 入队时刻, 与 call_redis_rpc envelope
+                    # 对齐: 消费端 stale 检查要求 ts+ttl 双非 None, 缺 ts 则丢弃半
+                    # 永不生效 (若未来切 queue 型 transport, 幽灵补执行形态会复活).
+                    "ts": time.time(),
                 }
                 response = transport.send_request(request, wait_seconds)
             else:
@@ -1024,14 +1028,20 @@ class BigQmtXtData:
         # [BUG-20260827-dispatch-drop-counters] INV-4: 路由层历史三处静默 return/pass
         # (json 残缺 / 未知 event_type / seq miss 兜底不中 + 回调异常) — 全部给计数,
         # get_dispatch_drop_stats() 快照给观测面, 阈值告警由消费方裁量。
+        # [BUG-20260903-03] ① 新增 control_echo: 后端自身 publish_event 控制命令回声
+        # (subscribe/unsubscribe_quote 同通道) 单列, 不再污染 unknown_type (真未知
+        # 才喊); ② 计数带 code 维度 (_dispatch_drop_codes) — 09-03 实弹 22.5k/日
+        # seq_miss 全是重启残渣, 无 code 维度则真断供 (09-02 型) 被噪音淹没不可分辨。
         self._dispatch_drop_lock = threading.Lock()
         self._dispatch_drops = {
             "malformed_event": 0,
             "unknown_type": 0,
+            "control_echo": 0,
             "seq_miss_no_fallback": 0,
             "callback_exception": 0,
             "empty_stock_code": 0,
         }
+        self._dispatch_drop_codes: dict = {}  # kind → {code: count} (有界, 快照取 top5)
         self._quote_event_thread = None
         self._quote_event_running = False
         # Unified bar quality contract — cumulative violation counts + throttled
@@ -1844,6 +1854,48 @@ class BigQmtXtData:
             target=self._quote_event_loop, name="bigqmt-quote-events", daemon=True
         )
         self._quote_event_thread.start()
+        # [BUG-20260903-03] 首次起监听 (进程首个订阅) 后延时清扫跨进程残留订阅 —
+        # hash 持久于 Redis, 重启后口径收缩时旧 seq 条目被 QMT pump 照推, 本进程
+        # 无回调 → seq_miss 纯残渣噪音 (09-03 实弹 22.5k+/日)。
+        try:
+            _sweep_t = threading.Timer(
+                120.0, self._sweep_orphan_subscriptions,
+            )
+            _sweep_t.daemon = True
+            _sweep_t.start()
+        except Exception:
+            pass  # 清扫是降噪面, 失败无害 (残留仅致 seq_miss 计数噪音)
+
+    def _sweep_orphan_subscriptions(self) -> None:
+        """[BUG-20260903-03] 一次性清理 hash 中无本进程回调的残留订阅条目.
+
+        判据: field(seq) ∉ _quote_callbacks = 本进程无消费者 — QMT pump 对这些
+        seq 的推送只会落 seq_miss_no_fallback 丢弃。清扫时点重验 (120s 延时窗内
+        迟到的新订阅已注册回调, 天然豁免); 订阅侧 seq 单调不回收, hgetall→hdel
+        窗口内新订阅只新增 field 不复用旧 seq, 无 TOCTOU 误删。多后端进程并存属
+        未支持部署形态 (单 uvicorn 判例), 跨进程保护不设防。
+        """
+        try:
+            _redis = self.client._redis()
+            _sub_key = "bigqmt:quote_subscriptions:%s" % (self.client.account_id or "")
+            _fields = _redis.hgetall(_sub_key) or {}
+            _orphans = []
+            for _k in _fields.keys():
+                _seq = _k.decode() if isinstance(_k, (bytes, bytearray)) else str(_k)
+                if _seq not in self._quote_callbacks:
+                    _orphans.append(_seq)
+            if _orphans:
+                _redis.hdel(_sub_key, *_orphans)
+                log.warning(
+                    "[BUG-20260903-orphan-sweep] 清理上一进程残留订阅 %d 条 "
+                    "(seq 无本进程回调, QMT pump 不再空推 → seq_miss 残渣噪音归零): "
+                    "%s",
+                    len(_orphans), _orphans[:20],
+                )
+        except Exception as exc:
+            log.warning(
+                "[BUG-20260903-orphan-sweep] 清理失败 (无害, 残留仅致计数噪音): %s", exc,
+            )
 
     def _quote_event_loop(self):
         from .quote_events import quote_channel
@@ -1878,20 +1930,28 @@ class BigQmtXtData:
         with self._dispatch_drop_lock:
             return dict(self._dispatch_drops)
 
-    def _bump_dispatch_drop(self, kind: str) -> None:
+    def _bump_dispatch_drop(self, kind: str, code=None) -> None:
         notify_at = 0
         with self._dispatch_drop_lock:
             if kind in self._dispatch_drops:
                 self._dispatch_drops[kind] += 1
                 notify_at = self._dispatch_drops[kind]
+                # [BUG-20260903-03] code 维度: 区分「重启残渣噪音」与「在订码真断供」
+                if code:
+                    _per_code = self._dispatch_drop_codes.setdefault(kind, {})
+                    _per_code[code] = _per_code.get(code, 0) + 1
         # [对抗复审 DEF-2 收口] INV-4 半程补齐: 计数不再只有"有人来读才有出口" —
         # 每 20 次/类 经 log.warning 落一行累计快照 (bigqmt.log 持久化通道), 热路径
         # 仅一次取模判断, 无额外 IO 直到触发。锁外取快照避免重入。
         if notify_at and notify_at % 20 == 0:
             try:
+                with self._dispatch_drop_lock:
+                    _per_code = self._dispatch_drop_codes.get(kind) or {}
+                    _top = dict(sorted(_per_code.items(), key=lambda kv: -kv[1])[:5])
                 log.warning(
-                    "[BUG-20260827-dispatch-drops] kind=%s count=%d snapshot=%s",
-                    kind, notify_at, self.get_dispatch_drop_stats(),
+                    "[BUG-20260827-dispatch-drops] kind=%s count=%d snapshot=%s"
+                    " top_codes=%s",
+                    kind, notify_at, self.get_dispatch_drop_stats(), _top,
                 )
             except Exception:
                 pass  # 观测告警自身不许反噬派发线程
@@ -1948,8 +2008,15 @@ class BigQmtXtData:
         if event.get("event_type") == _QUOTE_EVENT_HEARTBEAT:
             self._dispatch_heartbeat_event(event)
             return
-        if event.get("event_type") != "quote":
-            self._bump_dispatch_drop("unknown_type")
+        _etype = event.get("event_type")
+        if _etype != "quote":
+            # [BUG-20260903-03] 后端自身 publish_event 控制命令回声 (subscribe/
+            # unsubscribe_quote 与行情同通道, 监听线程自己消费) 不是未知事件 —
+            # 单列 control_echo, 不污染 unknown_type (真未知才值得喊)。
+            if _etype in ("subscribe_quote", "unsubscribe_quote"):
+                self._bump_dispatch_drop("control_echo")
+            else:
+                self._bump_dispatch_drop("unknown_type")
             return
         seq = event.get("seq")
         callback = self._quote_callbacks.get(seq)
@@ -1966,7 +2033,8 @@ class BigQmtXtData:
                     callback = self._quote_callbacks.get(_current_seq)
             if callback is None:
                 # [BUG-20260827-dispatch-drop-counters] 不再纯静默 — 计数留痕
-                self._bump_dispatch_drop("seq_miss_no_fallback")
+                # [BUG-20260903-03] 带 code 维度: 残渣噪音 vs 在订码真断供可分辨
+                self._bump_dispatch_drop("seq_miss_no_fallback", code=_code or None)
                 return
         stock_code = str(event.get("stock_code") or "")
         if not stock_code:
@@ -2002,7 +2070,7 @@ class BigQmtXtData:
             # [BUG-20260827-sub-registry-gc] 成功派发 = 消费端活, 节流写保活戳
             self._write_keepalive(str(seq or ""))
         except Exception:
-            self._bump_dispatch_drop("callback_exception")
+            self._bump_dispatch_drop("callback_exception", code=stock_code or None)
 
     def run(self):
         while True:

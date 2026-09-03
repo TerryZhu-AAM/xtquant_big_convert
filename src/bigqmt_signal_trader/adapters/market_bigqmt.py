@@ -27,18 +27,63 @@ This module does not make trading decisions.
 """
 
 import importlib
-import importlib.util
+import time
 
-from ..code_utils import normalize_stock_code
+from ..code_utils import (
+    EXCHANGE_TOKENS, FUTURES_MARKET_CODES, normalize_stock_code)
+from ..logging_setup import get_logger
+from ..quote_utils import find_code_payload, is_option_code, latest_quote_row
+
+
+log = get_logger("market")
 
 
 MARKET_CODES = {"SH", "SZ", "BJ", "HK"}
 
+# A market token asks QMT for every instrument the exchange lists, and stocks
+# are a small minority: "SH" answers with 26744 instruments of which 2315 (8.7%)
+# are stocks -- the rest is bonds, repos and the like. At a measured ~0.29ms per
+# instrument that is 7.5s for the whole market against 0.88s for the stocks
+# alone, and the cost is strictly linear in instrument count (issue #104).
+#
+# So narrow the REQUEST, not the response: resolve the token to a sector listing
+# and ask QMT only for those codes. Filtering afterwards would still pay for
+# every instrument. The sector lookup is FormulaServer-served (~10ms measured),
+# so it costs nothing next to what it saves.
+#
+# Sector names are QMT's own, verified against a live terminal. Note "北证A股"
+# is NOT one of them -- the Beijing board is "京市A股".
+STOCK_SECTOR_BY_MARKET = {
+    "SH": "上证A股",
+    "SZ": "深证A股",
+    "BJ": "京市A股",
+}
+# Cross-market sectors; results are filtered back to the requested exchange.
+# Not narrowing at all: "all" keeps the market token, i.e. the pre-0.2.15
+# behaviour of returning every instrument the exchange lists.
+DEFAULT_TICK_TYPES = ("stock",)
+
+SECTOR_BY_TYPE = {
+    "stock": "沪深京A股",
+    "fund": "沪深基金",
+    "etf": "沪深ETF",
+    "index": "沪深指数",
+    "convertible": "沪深转债",
+}
+
 
 def normalize_market_or_stock_code(code):
-    text = str(code or "").strip().upper()
-    if text in MARKET_CODES:
-        return text
+    """Market token, or a normalised instrument code.
+
+    Only the market-token test uppercases. Handing an uppercased string to
+    normalize_stock_code would defeat its case preservation, which is what kept
+    the #95 fix from reaching get_full_tick: "rb2610.SF" arrived there as
+    "RB2610.SF", a code QMT does not recognise. Futures symbols follow each
+    exchange's own convention and the spellings are not interchangeable.
+    """
+    text = str(code or "").strip()
+    if text.upper() in EXCHANGE_TOKENS:
+        return text.upper()
     return normalize_stock_code(text)
 
 
@@ -309,24 +354,49 @@ class BigQmtMarketDataProvider:
             self._native_xtdata = _load_native_xtdata()
         return self._native_xtdata
 
+    # In a Big QMT terminal the SDK never gains a quote service mid-process, so
+    # a failed native call is retried only once per this window instead of on
+    # every call: measured on Guojin 2.1.19.0, EVERY get_trading_dates paid the
+    # SDK's ~2.1s service-dial failure before falling back, and the first call
+    # after a strategy start paid 21.6s (issue #160).
+    NATIVE_FAILURE_CACHE_SECONDS = 600.0
+
+    def _native_dead_marks(self):
+        marks = getattr(self, "_native_dead_marks_dict", None)
+        if marks is None:
+            marks = self._native_dead_marks_dict = {}
+        return marks
+
+    def _native_known_dead(self, func_name):
+        ts = self._native_dead_marks().get(func_name)
+        return ts is not None and (time.time() - ts) < self.NATIVE_FAILURE_CACHE_SECONDS
+
     def _native_or_context(self, func_name, context_caller, *args, **kwargs):
         """Prefer the xtdata SDK function, fall back to a ContextInfo call.
 
         Several data APIs exist only as xtdata module functions. When the SDK
         is available AND its quote service is reachable we use it. Otherwise
         we fall back to ContextInfo so callers get a best-effort answer.
+
+        A native failure is remembered per function for
+        NATIVE_FAILURE_CACHE_SECONDS: in Big QMT the failure mode is "SDK
+        present, quote service absent", which does not heal mid-process, and
+        paying its multi-second dial timeout on every call made
+        get_trading_dates cost 2.1s per call forever (issue #160).
         """
         module = self._native()
-        if module is not None:
+        if module is not None and not self._native_known_dead(func_name):
             fn = getattr(module, func_name, None)
             if fn is not None:
                 try:
-                    return fn(*args, **kwargs)
-                except Exception as exc:
+                    result = fn(*args, **kwargs)
+                    self._native_dead_marks().pop(func_name, None)
+                    return result
+                except Exception:
                     # Big QMT path: SDK present but no quote service to talk
                     # to ("无法连接行情服务"). Don't crash — let the ContextInfo
                     # fallback have a turn.
-                    pass
+                    self._native_dead_marks()[func_name] = time.time()
         return context_caller()
 
     def _call_first_supported(self, shapes):
@@ -423,7 +493,68 @@ class BigQmtMarketDataProvider:
             ),
         ]
 
-    def get_ticks(self, codes):
+    def _sector_codes(self, sector):
+        """Cached sector listing. Membership does not change intraday and the
+        lookup is FormulaServer-served, so once per sector per run is enough."""
+        cache = getattr(self, "_sector_cache", None)
+        if cache is None:
+            cache = self._sector_cache = {}
+        if sector not in cache:
+            try:
+                cache[sector] = list(self.get_stock_list_in_sector(sector) or [])
+            except Exception:
+                cache[sector] = []
+        return cache[sector]
+
+    def _expand_market_token(self, market, types):
+        """Codes of the requested types on one exchange, or None to give up.
+
+        None means "could not narrow", and the caller keeps the market token: a
+        slow answer beats an empty one, the same rule the key mapping below
+        follows.
+        """
+        collected = []
+        for kind in types:
+            kind = str(kind or "").strip().lower()
+            sector = None
+            if kind == "stock":
+                sector = STOCK_SECTOR_BY_MARKET.get(market)
+            if sector is None:
+                sector = SECTOR_BY_TYPE.get(kind)
+            if sector is None:
+                return None          # unknown type: do not silently drop it
+            listing = self._sector_codes(sector)
+            if not listing:
+                return None          # sector unavailable on this terminal
+            suffix = "." + market
+            collected.extend(c for c in listing if str(c).upper().endswith(suffix))
+        seen, unique = set(), []
+        for code in collected:
+            if code not in seen:
+                seen.add(code)
+                unique.append(code)
+        return unique or None
+
+    def _notice_narrowed(self, market, kept, total_hint):
+        """Say once per process that a market token was narrowed.
+
+        The default changed from "everything the exchange lists" to stocks, so
+        a caller who wanted bonds or repos would otherwise just see fewer rows
+        and no reason why.
+        """
+        seen = getattr(self, "_narrow_notified", None)
+        if seen is None:
+            seen = self._narrow_notified = set()
+        if market in seen:
+            return
+        seen.add(market)
+        try:
+            print("[bigqmt_market] %s narrowed to %d %s; pass types=['all'] for "
+                  "every instrument the exchange lists" % (market, kept, total_hint))
+        except Exception:
+            pass
+
+    def get_ticks(self, codes, types=None):
         """Snapshot quotes, keyed the way the CALLER spelled each code.
 
         Codes go to QMT upper-cased, but the futures exchanges use lower-case
@@ -443,22 +574,80 @@ class BigQmtMarketDataProvider:
         """
         requested = list(codes or [])
         normalized_codes = [normalize_market_or_stock_code(code) for code in requested]
+        # Default to stocks. A market token lists every instrument the exchange
+        # carries and stocks are 8.7% of it, so the old default made everyone pay
+        # 7.5s for a 0.9s answer. types=["all"] restores the full listing.
+        wanted = list(types) if types else list(DEFAULT_TICK_TYPES)
+        if not any(str(kind).strip().lower() == "all" for kind in wanted):
+            expanded = []
+            for code in normalized_codes:
+                # A futures exchange lists only futures, so its token already
+                # says what it holds -- there is nothing to narrow and no
+                # A-share sector to narrow it with.
+                narrowable = code in MARKET_CODES and code not in FUTURES_MARKET_CODES
+                narrowed = (self._expand_market_token(code, wanted)
+                            if narrowable else None)
+                if narrowed is None:
+                    expanded.append(code)     # not a token, or could not narrow
+                else:
+                    expanded.extend(narrowed)
+                    self._notice_narrowed(code, len(narrowed), "/".join(wanted))
+            normalized_codes = expanded
         data = self.context_info.get_full_tick(normalized_codes) or {}
         if not isinstance(data, dict):
             return data or {}
 
-        # Case-only differences map back; structural ones (added suffix) do not.
-        # Later duplicates keep the first spelling.
-        original_by_normalized = {}
+        # Full Big-QMT 2.1.19.0 can return no entry from get_full_tick for an
+        # explicitly requested .SHO/.SZO contract even while its tick stream is
+        # active. The same contract is available through get_market_data_ex
+        # (period="tick"), including the five-level book. Recover only missing
+        # option symbols so the fast native path for stocks/funds is unchanged.
+        answered = {str(key).upper() for key in data}
+        missing_options = [
+            code for code in normalized_codes
+            if is_option_code(code) and str(code).upper() not in answered
+        ]
+        if missing_options:
+            try:
+                fallback = self.get_market_data_ex(
+                    field_list=[],
+                    stock_list=missing_options,
+                    period="tick",
+                    count=1,
+                    dividend_type="none",
+                    fill_data=False,
+                ) or {}
+                for code in missing_options:
+                    row = latest_quote_row(find_code_payload(fallback, code))
+                    if row:
+                        data[code] = row
+            except Exception as exc:
+                # A mixed stock/option request must still return the native
+                # snapshots it already has when an older QMT lacks this API.
+                if not getattr(self, "_option_tick_fallback_warned", False):
+                    self._option_tick_fallback_warned = True
+                    log.warning(
+                        "option tick fallback failed for %s: %s",
+                        missing_options, exc,
+                    )
+
+        # Map any answer key back to the caller's spelling when the two differ
+        # only by case. Keyed on the upper-cased form deliberately: we now send
+        # the caller's own spelling, so this must work whether QMT echoes that
+        # back or answers in a canonical case of its own -- and which of those
+        # it does could not be observed here (no futures data on this terminal).
+        # Structural differences (a completed suffix) are left alone, since
+        # "600000" -> "600000.SH" is normalization callers rely on.
+        original_by_upper = {}
         for original, normalized in zip(requested, normalized_codes):
             original, normalized = str(original), str(normalized)
-            if original != normalized and original.upper() == normalized.upper():
-                original_by_normalized.setdefault(normalized, original)
+            if original.upper() == normalized.upper():
+                original_by_upper.setdefault(original.upper(), original)
 
-        if not original_by_normalized:
+        if not original_by_upper:
             return data
         return dict(
-            (original_by_normalized.get(str(key), key), value)
+            (original_by_upper.get(str(key).upper(), key), value)
             for key, value in data.items()
         )
 
@@ -606,9 +795,10 @@ class BigQmtMarketDataProvider:
         # — note the FIRST argument differs (market vs stockcode). Every caller in
         # this codebase passes a market code, so the xtdata SDK is the correct path.
         def _via_context():
-            # ContextInfo's first arg is stockcode; pass market through anyway so
-            # backtest contexts still return something rather than crashing.
-            return self._call_context("get_trading_dates", market, start_time, end_time, count)
+            # ContextInfo 需要证券代码而不是市场代码；SH/SZ 使用代表指数，
+            # 调用方已经传入完整代码时保持原值。
+            context_stock = {"SH": "000001.SH", "SZ": "399001.SZ"}.get(str(market).upper(), market)
+            return self._call_context("get_trading_dates", context_stock, start_time, end_time, count)
 
         return self._native_or_context(
             "get_trading_dates", _via_context, market, start_time, end_time, count
@@ -746,14 +936,23 @@ class BigQmtMarketDataProvider:
         "沪市基金", "深市基金", "沪深ETF",
     )
 
-    def get_sector_list(self):
-        """Return the list of sector names.
+    def get_sector_list(self, allow_fallback=False):
+        """Return the terminal's sector names, or say it cannot (issue #143).
 
-        Authoritative source is the xtdata SDK (xtdata.py line 784). In a Big
-        QMT (full terminal) process the SDK is present but cannot reach its
-        quote service, and ContextInfo has no get_sector_list method either.
-        In that case we fall back to a curated list of well-known sector names
-        so callers can still drive get_stock_list_in_sector(name).
+        The authoritative source is the xtdata SDK. Inside a Big QMT full
+        terminal the SDK is present but cannot reach its quote service
+        ("无法连接行情服务"), and ContextInfo has no get_sector_list at all --
+        so on this class of terminal there is no real answer.
+
+        This used to return ``_FALLBACK_SECTORS`` in that case: 13 curated
+        names, indistinguishable from a real listing. The caller cannot tell,
+        and a user's own sectors never appear no matter how many they created.
+        I gave a wrong answer on issue #130 by reading exactly that list and
+        believing it, which is the whole argument for raising instead.
+
+        Pass ``allow_fallback=True`` to opt into the curated names -- they are
+        still useful for driving ``get_stock_list_in_sector``, which does work.
+        Asking for them is fine; being handed them unasked is not.
         """
         def _via_context():
             return self._call_context("get_sector_list")
@@ -762,9 +961,20 @@ class BigQmtMarketDataProvider:
             result = self._native_or_context("get_sector_list", _via_context)
             if result:
                 return result
-        except (NotImplementedError, Exception):
+        except Exception:
             pass
-        return list(self._FALLBACK_SECTORS)
+        # A JSON-RPC caller sends "true"/"1"; a Python caller sends True.
+        if str(allow_fallback).strip().lower() in ("1", "true", "yes", "on"):
+            return list(self._FALLBACK_SECTORS)
+        raise NotImplementedError(
+            "get_sector_list cannot enumerate this terminal's sectors: the "
+            "native xtdata SDK is present but its quote service is unreachable "
+            "from inside Big QMT, and ContextInfo has no get_sector_list. It "
+            "used to answer with a hardcoded list of %d well-known names, "
+            "which looks exactly like a real listing and never contains your "
+            "own sectors (issue #143). Pass allow_fallback=True to get those "
+            "names deliberately -- get_stock_list_in_sector works with them."
+            % len(self._FALLBACK_SECTORS))
 
     def get_sector_info(self, sector_name=""):
         # xtdata SDK 函数，ContextInfo 无此方法，走 native SDK。
@@ -1021,12 +1231,171 @@ class BigQmtMarketDataProvider:
         return self._call_context("get_hkt_details", stock_code)
 
     # ------------------------------------------------------------------
-    # 自定义板块管理（写操作，仅 ContextInfo 支持）
+    # 自定义板块写入（issue #143）
+    #
+    # 三条通道都枚举过（probe_capabilities 的 sector_probe 块）：
+    #
+    #   ContextInfo        create_sector / get_sector / get_stock_list_in_sector
+    #   QMT 注入的全局函数  一个都没有
+    #   原生 xtdata SDK     add_sector / remove_sector / get_sector_list
+    #
+    # 文档 §4.7 记的那一族（create_sector_folder / add_stock_to_sector /
+    # reset_sector_stock_list / remove_stock_from_sector）在三条通道上都不
+    # 存在 —— 不是「还没实现」，是这台终端给不出来。所以它们在这里用
+    # add_sector 组合出来，而不是去找一个不存在的原生函数。
+    #
+    # 而 ContextInfo.create_sector 存在、能调、返回 None、什么都不做：实测
+    # 前后都是 13 个板块，新板块一个没建。所以每一次写入之后都回读校验。
+    # 宁可把一次成功的写入误报成失败，也不能再让调用方以为建好了 —— #142
+    # 就是这么来的，而静默的错比响亮的错难查得多。
     # ------------------------------------------------------------------
 
+    _SECTOR_WRITE_UNAVAILABLE = (
+        "%s cannot be performed on this terminal: the native xtdata sector API "
+        "(add_sector/remove_sector) is present but its quote service is "
+        "unreachable from inside Big QMT (\"无法连接行情服务\"), and Big QMT's "
+        "own ContextInfo exposes only create_sector, which accepts the call and "
+        "silently does nothing. Run probe_capabilities and read sector_probe to "
+        "see which channels this terminal has (issue #143)."
+    )
+
+    @staticmethod
+    def _sector_code_key(code):
+        """Compare membership without tripping over case or spacing."""
+        text = str(code or "").strip()
+        if not text:
+            return ""
+        try:
+            return normalize_stock_code(text)
+        except Exception:
+            return text.upper()
+
+    def _sector_members(self, sector_name):
+        """Current members, or [] when the sector does not exist yet.
+
+        Read-only and uncached: the caller is about to write, so the cached
+        listing used by _sector_codes would be exactly the wrong answer.
+        """
+        try:
+            return [str(code) for code in (
+                self.get_stock_list_in_sector(sector_name) or [])]
+        except Exception:
+            return []
+
+    def _write_sector(self, method_name, sector_name, stock_list):
+        """Push a full member list, preferring the only channel that works.
+
+        Returns whatever the channel returned; the caller verifies. Raises
+        NotImplementedError when no channel exists at all, so "impossible" and
+        "attempted but ineffective" stay distinguishable.
+        """
+        codes = [str(code) for code in (stock_list or [])]
+        module = self._native()
+        native_error = None
+        if module is not None and callable(getattr(module, "add_sector", None)):
+            try:
+                return module.add_sector(sector_name, codes)
+            except Exception as exc:
+                native_error = exc
+        context_info = getattr(self, "context_info", None)
+        if callable(getattr(context_info, "create_sector", None)):
+            # Known no-op on Big QMT 2.1.19.0 -- tried anyway because another
+            # build may honour it, and the caller's verify step catches it
+            # either way.
+            return self._call_context("create_sector", sector_name, codes)
+        raise NotImplementedError(
+            (self._SECTOR_WRITE_UNAVAILABLE % method_name)
+            + ("" if native_error is None
+               else " Native attempt failed with: %s: %s"
+                    % (native_error.__class__.__name__, native_error)))
+
+    def _verify_sector_members(self, method_name, sector_name,
+                               must_contain=(), must_not_contain=()):
+        """Read the sector back and confirm the write actually landed."""
+        members = {self._sector_code_key(code)
+                   for code in self._sector_members(sector_name)}
+        missing = [code for code in must_contain
+                   if self._sector_code_key(code) not in members]
+        lingering = [code for code in must_not_contain
+                     if self._sector_code_key(code) in members]
+        if missing or lingering:
+            detail = []
+            if missing:
+                detail.append("still missing %s" % (missing[:5],))
+            if lingering:
+                detail.append("still present %s" % (lingering[:5],))
+            raise RuntimeError(
+                "%s on sector %r reported no error but the sector did not "
+                "change (%s). Big QMT's ContextInfo.create_sector accepts the "
+                "call and does nothing; this terminal has no working sector "
+                "write channel (issue #143)."
+                % (method_name, sector_name, "; ".join(detail)))
+        return True
+
     def create_sector(self, sector_name, stock_list):
-        # ContextInfo stub: create_sector(sectorname, stocklist) — 创建/更新自定义板块。
-        return self._call_context("create_sector", sector_name, list(stock_list or []))
+        """Create (or overwrite) a custom sector and confirm it exists.
+
+        Signature deliberately NOT the ``(parent_node, sector_name, overwrite)``
+        form in docs §4.7: that function is absent from all three channels on
+        every terminal probed so far, while ``add_sector(name, stock_list)`` is
+        the shape the real SDK offers. Adopting a signature for a function that
+        does not exist would trade one wrong answer for another.
+        """
+        codes = [str(code) for code in (stock_list or [])]
+        self._write_sector("create_sector", sector_name, codes)
+        self._verify_sector_members("create_sector", sector_name, must_contain=codes)
+        return sector_name
+
+    def reset_sector_stock_list(self, sector, stock_list):
+        """Replace a sector's members outright."""
+        codes = [str(code) for code in (stock_list or [])]
+        self._write_sector("reset_sector_stock_list", sector, codes)
+        self._verify_sector_members("reset_sector_stock_list", sector,
+                                    must_contain=codes)
+        return True
+
+    def add_stock_to_sector(self, sector, stock_code):
+        """Add one code, keeping the existing members.
+
+        Read-merge-write rather than a bare append, so it is correct whether
+        the underlying channel replaces the list or merges into it -- the two
+        SDK generations disagree about that and this terminal cannot be asked.
+        """
+        code = str(stock_code or "").strip()
+        if not code:
+            raise ValueError("stock_code is required")
+        members = self._sector_members(sector)
+        if self._sector_code_key(code) in {self._sector_code_key(m) for m in members}:
+            return True
+        self._write_sector("add_stock_to_sector", sector, members + [code])
+        self._verify_sector_members("add_stock_to_sector", sector,
+                                    must_contain=[code])
+        return True
+
+    def remove_stock_from_sector(self, sector, stock_code):
+        """Drop one code, keeping the rest.
+
+        The verify step matters most here: if the channel merges instead of
+        replacing, the write "succeeds" and the code stays -- silently, which
+        is the failure mode this whole family is being fixed for.
+        """
+        code = str(stock_code or "").strip()
+        if not code:
+            raise ValueError("stock_code is required")
+        wanted = self._sector_code_key(code)
+        members = self._sector_members(sector)
+        remaining = [m for m in members if self._sector_code_key(m) != wanted]
+        if len(remaining) == len(members):
+            return True                      # not a member; nothing to do
+        self._write_sector("remove_stock_from_sector", sector, remaining)
+        self._verify_sector_members("remove_stock_from_sector", sector,
+                                    must_not_contain=[code])
+        return True
+
+    def create_sector_folder(self, parent_node, folder_name, overwrite=False):
+        """No channel on any probed terminal offers this."""
+        raise NotImplementedError(
+            self._SECTOR_WRITE_UNAVAILABLE % "create_sector_folder")
 
     # ------------------------------------------------------------------
     # 基础查询辅助
@@ -1185,26 +1554,34 @@ class BigQmtMarketDataProvider:
     # ------------------------------------------------------------------
 
     def add_sector(self, sector_name, stock_list):
-        # xtdata SDK: add_sector(sector_name, stock_list) — 向自定义板块追加股票。
-        # ContextInfo 用 create_sector（覆盖式），SDK 用 add_sector（追加式）。
-        module = self._native()
-        if module is not None and hasattr(module, "add_sector"):
-            try:
-                return module.add_sector(sector_name, list(stock_list or []))
-            except Exception:
-                pass
-        # ContextInfo fallback：create_sector 是覆盖式，语义略不同但可用。
-        return self._call_context("create_sector", sector_name, list(stock_list or []))
+        """xtdata SDK ``add_sector(sector_name, stock_list)``.
+
+        Used to swallow the native failure and fall through to
+        ContextInfo.create_sector -- which does nothing, so on Big QMT this was
+        a silent no-op too (issue #143). It now goes through the same
+        write-then-verify path as the rest of the family.
+        """
+        codes = [str(code) for code in (stock_list or [])]
+        self._write_sector("add_sector", sector_name, codes)
+        self._verify_sector_members("add_sector", sector_name, must_contain=codes)
+        return True
 
     def remove_sector(self, sector_name):
-        # xtdata SDK: remove_sector(sector_name) — 删除自定义板块。
+        """xtdata SDK ``remove_sector(sector_name)`` -- delete a custom sector.
+
+        No ContextInfo equivalent exists (`remove_sector` is absent there), so
+        this is the one member of the family with a single channel.
+        """
         module = self._native()
-        if module is not None and hasattr(module, "remove_sector"):
+        if module is not None and callable(getattr(module, "remove_sector", None)):
             try:
                 return module.remove_sector(sector_name)
-            except Exception:
-                pass
-        return self._raise_unavailable("remove_sector")
+            except Exception as exc:
+                raise RuntimeError(
+                    "remove_sector(%r) failed on the native xtdata SDK: %s: %s"
+                    % (sector_name, exc.__class__.__name__, exc))
+        raise NotImplementedError(
+            self._SECTOR_WRITE_UNAVAILABLE % "remove_sector")
 
     # ------------------------------------------------------------------
     # 数据下载扩展

@@ -323,8 +323,12 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(trades[0].order_type, STOCK_BUY)
         self.assertEqual(trades[0].traded_price, 10.0)
         self.assertEqual(trades[0].order_remark, "remark-1")
-        self.assertEqual(order_id, "sys-2")
-        self.assertTrue(cancelled)
+        # MiniQMT hands back an int 委托编号; Big QMT only has the broker's
+        # string 合同编号, so the id is both (issue #113).
+        self.assertEqual(str(order_id), "sys-2")
+        self.assertIsInstance(order_id, int)
+        self.assertGreater(order_id, 0)
+        self.assertEqual(cancelled, 0)      # 0 == success, not True
         self.assertEqual(trader.client.calls[-2][1]["price_type"], MARKET_PEER_PRICE_FIRST)
         # strategy_name 默认 ""（返回全部委托），与服务端一致（strategy_name 陷阱）。
         self.assertEqual(trader.client.calls[-4][1]["strategy_name"], "")
@@ -495,11 +499,41 @@ class XtquantCompatTest(unittest.TestCase):
     def test_quote_subscribe_and_unsubscribe_write_redis_events(self):
         xtdata = self._xtdata()
 
+        # Tick subscriptions ride the whole-quote push session now (#95), so
+        # stand one in; the bookkeeping this test covers is unchanged.
+        class _Session(object):
+            def __init__(self):
+                self.active = set()
+                self.subscribed = []
+
+            def start(self):
+                pass
+
+            def subscribe_whole_quote(self, code_list, callback=None):
+                self.subscribed.append(list(code_list))
+                sub_id = 900 + len(self.subscribed)
+                self.active.add(sub_id)
+                return sub_id
+
+            def unsubscribe_quote(self, sub_id):
+                self.active.discard(sub_id)
+                return 0
+
+            def has_subscription(self, sub_id):
+                return sub_id in self.active
+
+        session = _Session()
+        xtdata._quote_session_factory = lambda: session
+
         seq = xtdata.subscribe_quote("600000.SH", period="tick")
         result = xtdata.unsubscribe_quote(seq)
 
         key = "bigqmt:quote_subscriptions:acct"
         self.assertEqual(result, 0)
+        # [merge 2026-09-03 裁决] tick 订阅改走本地 quote_events 通路 (Redis hash
+        # 泵 + seq 路由), 不经 whole-quote session — 原上游 session 路由断言
+        # (session.subscribed / session.active) 移除; redis 事件与注册簿账本
+        # 断言保留: 两种架构下都必须成立的核心契约。
         self.assertNotIn(str(seq), xtdata.client.redis.hashes.get(key, {}))
         self.assertIn((key, str(seq)), xtdata.client.redis.deleted)
         self.assertEqual(xtdata.client.redis.events[0][0], "subscribe_quote")
@@ -822,6 +856,232 @@ class XtquantCompatTest(unittest.TestCase):
         self.assertEqual(transport.name, "zmq")
         self.assertEqual(transport.connect_address, "tcp://127.0.0.1:20146")
         self.assertIsNone(transport.discovery_redis_client)
+
+    def test_pure_zmq_quote_metadata_does_not_build_redis_client(self):
+        """纯 ZMQ 的兼容订阅元数据不能隐式连接 Redis。"""
+        client = BigQmtRpcClient(account_id="acct", redis_config={"transport": "zmq"})
+        client._redis = lambda: (_ for _ in ()).throw(AssertionError("Redis must not be used"))
+
+        event = client.publish_event("subscribe_quote", {"seq": 1})
+        client.save_quote_subscription(1, {"seq": 1}, active=True)
+
+        self.assertEqual(event["event_type"], "subscribe_quote")
+
+    def test_mysql_quote_metadata_keeps_existing_redis_path(self):
+        """非 ZMQ transport 继续使用既有 Redis 订阅元数据。"""
+        class RedisRecorder:
+            def __init__(self):
+                self.calls = []
+                self.store = {}
+
+            def xadd(self, *args, **kwargs):
+                self.calls.append("xadd")
+
+            def publish(self, *args, **kwargs):
+                self.calls.append("publish")
+
+            def hset(self, *args, **kwargs):
+                self.calls.append("hset")
+                self.store[(args[0], str(args[1]))] = args[2]
+
+            # [merge 2026-09-03] 本地 save_quote_subscription 契约含写后回读校验
+            # (BUG-20260827 静默丢笔修复): 健康 redis 必须答 hget — fake 补齐,
+            # 否则 save 吃满重试并多记一次 hset。
+            def hget(self, *args, **kwargs):
+                self.calls.append("hget")
+                return self.store.get((args[0], str(args[1])))
+
+        redis = RedisRecorder()
+        client = BigQmtRpcClient(account_id="acct", redis_client=redis, redis_config={"transport": "mysql"})
+
+        client.publish_event("subscribe_quote", {"seq": 1})
+        client.save_quote_subscription(1, {"seq": 1}, active=True)
+
+        # [merge 2026-09-03] 期望序列随本地写后回读契约 +hget (hset 后立即回读)。
+        self.assertEqual(redis.calls, ["xadd", "publish", "hset", "hget"])
+
+
+class UseFormulaBypassTest(unittest.TestCase):
+    """use_formula=False：必须最新数据的调用（subscribe_quote 盘中轮询）
+    不走 FormulaServer 快照直连。"""
+
+    def test_call_with_use_formula_false_skips_router(self):
+        calls = []
+
+        class _FakeRouter:
+            def supports(self, method):
+                return True
+
+            def call(self, method, params):
+                raise AssertionError("router must not be called when use_formula=False")
+
+        class _FakeTransport:
+            def send_request(self, request, timeout_seconds):
+                calls.append(request["method"])
+                return {"ok": True, "data": {"pong": True}}
+
+        client = BigQmtRpcClient(account_id="acct", redis_config={"host": "127.0.0.1"})
+        client.transport_name = "zmq"
+        client._transport_instance = _FakeTransport()
+        client._formula_router_instance = _FakeRouter()
+
+        result = client.call("get_market_data_ex", {"x": 1}, use_formula=False)
+        self.assertEqual(result, {"pong": True})
+        self.assertEqual(calls, ["get_market_data_ex"])
+
+    @unittest.skip("[merge 2026-09-03 裁决] subscribe_quote 采用本地 quote_events 生产通路 (Redis hash 泵 + seq 路由 + save fail-LOUD), 上游 0.3.x 的 whole-quote session / _BarPoller 轮询引擎未采用; 本组锁定的是未采用引擎的内部行为 — 引擎本体保留 (subscribe_whole_quote 仍走 session), 引擎路径若未来启用再解跳。")
+    def test_subscribe_quote_fetch_uses_rpc_not_formula(self):
+        xt = BigQmtXtData(FakeRpcClient())
+        recorded = {}
+
+        def spy(**kwargs):
+            recorded.update(kwargs)
+            return {"acct": None}
+
+        fetch_holder = {}
+
+        from bigqmt_signal_trader.xtquant_compat import _BarPoller
+
+        class _P(_BarPoller):
+            def __init__(self, f, callback, interval, **kwargs):
+                fetch_holder["fetch"] = f
+                super().__init__(f, callback, interval, **kwargs)
+
+        import bigqmt_signal_trader.xtquant_compat as compat_mod
+        compat_mod._BarPoller = _P
+        try:
+            xt.get_market_data_ex = spy
+            xt.subscribe_quote("600000.SH", period="1m", count=1, callback=None)
+        finally:
+            compat_mod._BarPoller = _BarPoller
+
+        fetch = fetch_holder.get("fetch")
+        self.assertIsNotNone(fetch)
+        fetch()
+        self.assertFalse(recorded.get("use_formula", True),
+                         "subscribe_quote 盘中轮询必须 use_formula=False（读实时数据）")
+
+
+class FormulaStaleFailoverTest(unittest.TestCase):
+    """公式滞后自动回落：本次调用回落 RPC 桥、冷却期跳过直连、到期自愈。"""
+
+    def _bar(self, ts):
+        import pandas as pd
+
+        return pd.DataFrame({"stime": [ts], "close": [1.0]})
+
+    def setUp(self):
+        import datetime as _dt
+        from bigqmt_signal_trader import xtquant_compat as xc
+
+        self.xc = xc
+        self.xc._formula_stale_until["ts"] = 0.0
+        self.old_bar = (_dt.datetime.now() - _dt.timedelta(hours=3)).strftime("%Y%m%d%H%M%S")
+        self.fresh_bar = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+
+    def _client(self, stale):
+        xc = self.xc
+
+        class _Router:
+            def __init__(self):
+                self.calls = 0
+
+            def supports(self, method):
+                return True
+
+            def call(self, method, params):
+                self.calls += 1
+                bar = self.old_bar if stale else self.fresh_bar
+                return {"600000.SH": self._bar(bar)}
+
+        class _Transport:
+            def __init__(self):
+                self.calls = 0
+
+            def send_request(self, request, timeout_seconds):
+                self.calls += 1
+                return {"ok": True, "data": {"fresh": True}}
+
+        router = _Router()
+        router.old_bar = self.old_bar
+        router.fresh_bar = self.fresh_bar
+        router._bar = self._bar
+        transport = _Transport()
+        client = BigQmtRpcClient(account_id="acct", redis_config={"host": "127.0.0.1"})
+        client.transport_name = "zmq"
+        client._transport_instance = transport
+        client._formula_router_instance = router
+        return client, router, transport
+
+    def test_stale_answer_fails_over_to_transport(self):
+        client, router, transport = self._client(stale=True)
+        result = client.call("get_market_data_ex", {"period": "1m"})
+        self.assertEqual(result, {"fresh": True})
+        self.assertEqual(transport.calls, 1)
+
+    def test_cooldown_skips_router(self):
+        client, router, transport = self._client(stale=True)
+        client.call("get_market_data_ex", {"period": "1m"})
+        self.assertEqual(router.calls, 1)
+        client.call("get_market_data_ex", {"period": "1m"})
+        self.assertEqual(router.calls, 1)  # 冷却期内不再付公式成本
+        self.assertEqual(transport.calls, 2)
+
+    def test_cooldown_expiry_restores_formula(self):
+        client, router, transport = self._client(stale=True)
+        client.call("get_market_data_ex", {"period": "1m"})
+        self.xc._formula_stale_until["ts"] = 0.0
+        client2, router2, _ = self._client(stale=False)
+        result = client2.call("get_market_data_ex", {"period": "1m"})
+        self.assertEqual(router2.calls, 1)
+        self.assertNotEqual(result, {"fresh": True})
+
+
+class FormulaStaleWarnTest(unittest.TestCase):
+    """FormulaServer 快照滞后检测：intraday 滞后即告警、同日不重复、日线不报。"""
+
+    def _df(self, bar):
+        import pandas as pd
+
+        return pd.DataFrame({"close": [1.0]}, index=[bar])
+
+    def setUp(self):
+        import datetime as _dt
+        from bigqmt_signal_trader import xtquant_compat as xc
+
+        self.xc = xc
+        self.warns = []
+        self._orig_log = xc.log
+
+        class _L:
+            def warning(_, msg, *a):
+                self.warns.append(msg % a if a else msg)
+
+        xc.log = _L()
+        xc._formula_stale_warned.clear()
+        self.old_bar = (_dt.datetime.now() - _dt.timedelta(hours=3)).strftime("%Y%m%d%H%M%S")
+        self.fresh_bar = _dt.datetime.now().strftime("%Y%m%d%H%M%S")
+
+    def tearDown(self):
+        self.xc.log = self._orig_log
+
+    def test_intraday_stale_bar_warns_once_per_day(self):
+        self.xc._warn_stale_formula_bars({"600000.SH": self._df(self.old_bar)}, {"period": "1m"})
+        self.xc._warn_stale_formula_bars({"600000.SH": self._df(self.old_bar)}, {"period": "1m"})
+        self.assertEqual(len(self.warns), 1)
+        self.assertIn("stale", self.warns[0])
+
+    def test_fresh_bar_does_not_warn(self):
+        self.xc._warn_stale_formula_bars({"600000.SH": self._df(self.fresh_bar)}, {"period": "1m"})
+        self.assertEqual(self.warns, [])
+
+    def test_daily_period_is_not_time_checked(self):
+        self.xc._warn_stale_formula_bars({"600000.SH": self._df(self.old_bar)}, {"period": "1d"})
+        self.assertEqual(self.warns, [])
+
+    def test_bad_input_never_raises(self):
+        self.xc._warn_stale_formula_bars(None, {})
+        self.xc._warn_stale_formula_bars({"X": self._df("not-a-date")}, {"period": "1m"})
 
 
 if __name__ == "__main__":

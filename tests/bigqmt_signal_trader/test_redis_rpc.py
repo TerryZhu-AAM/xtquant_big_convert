@@ -8,9 +8,10 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
+from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
 from bigqmt_signal_trader.models import (
-    AssetSnapshot, OrderRequest, OrderSnapshot, OrderSubmitResult,
+    AssetSnapshot, CancelResult, OrderRequest, OrderSnapshot, OrderSubmitResult,
     PositionSnapshot, TradeSnapshot,
 )
 from bigqmt_signal_trader.redis_rpc import (
@@ -68,6 +69,41 @@ class FakePositionProvider:
 
     def get_asset(self, account_id):
         return AssetSnapshot(account_id=account_id, cash=100.0, total_asset=1000.0)
+
+
+class CreditCompactQueryTest(unittest.TestCase):
+    def test_compact_queries_pass_configured_account_type(self):
+        calls = []
+
+        def query(*args):
+            calls.append(args)
+            return []
+
+        gateway = DryRunOrderGateway()
+        gateway.account_type = "credit"
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+            qmt_api={
+                "get_unclosed_compacts": query,
+                "get_closed_compacts": query,
+            },
+        )
+
+        handlers._handle_query_stk_compacts({})
+        handlers._handle_get_unclosed_compacts({})
+        handlers._handle_get_closed_compacts({})
+
+        self.assertEqual(
+            calls,
+            [
+                ("acct", "CREDIT"),
+                ("acct", "CREDIT"),
+                ("acct", "CREDIT"),
+            ],
+        )
 
 
 def _service(allow_order_methods=False, process_in_listener=False):
@@ -248,6 +284,170 @@ class LateLandingOrderGateway(DryRunOrderGateway):
                 status="50",
             )
         ]
+
+
+class FalseyCancelGateway(DryRunOrderGateway):
+    """Full QMT #148: native cancel is falsey before status confirms success."""
+
+    def __init__(self, statuses, native_success=False, query_error=None):
+        super().__init__()
+        self.statuses = list(statuses)
+        self.native_success = native_success
+        self.query_error = query_error
+        self.lookups = 0
+
+    def cancel(self, order_ref):
+        self.cancelled.append(order_ref)
+        return CancelResult(
+            success=self.native_success,
+            message="" if self.native_success else "cancel returned false",
+        )
+
+    def query_orders(self, account_id, strategy_name):
+        self.lookups += 1
+        if self.query_error is not None:
+            raise self.query_error
+        if not self.statuses:
+            return []
+        status = self.statuses[min(self.lookups - 1, len(self.statuses) - 1)]
+        return [
+            OrderSnapshot(
+                order_sys_id="cancel-1",
+                user_order_id="remark-cancel-1",
+                stock_code="510050.SH",
+                action="BUY",
+                volume=100,
+                traded_volume=0,
+                status=status,
+            )
+        ]
+
+
+class AsyncCancelSettlementTest(unittest.TestCase):
+    """issue #148: order status, not cancel() truthiness, is authoritative."""
+
+    @staticmethod
+    def _service(gateway, timeout=5.0):
+        redis_client = FakeRedis()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=gateway,
+            allow_order_methods=True,
+            order_settle_timeout_seconds=timeout,
+        )
+        return redis_client, RedisPubSubRpcService(
+            redis_client, handlers, account_id="acct")
+
+    @staticmethod
+    def _cancel(service, request_id="cancel-request-1"):
+        service.enqueue_payload({
+            "request_id": request_id,
+            "account_id": "acct",
+            "method": "cancel_order_stock_sysid",
+            "params": {"order_sysid": "cancel-1"},
+        })
+
+    def test_falsey_native_return_waits_for_status_54_and_reports_success(self):
+        gateway = FalseyCancelGateway(["50", "54"])
+        redis_client, service = self._service(gateway)
+        self._cancel(service)
+
+        service.drain_pending()
+        self.assertNotIn(
+            "bigqmt:rpc:resp:acct:cancel-request-1", redis_client.kv)
+        self.assertEqual(service.pending_settlement_count(), 1)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertTrue(response["data"]["success"])
+        self.assertEqual(response["data"]["message"], "")
+        self.assertEqual(gateway.lookups, 2)
+        self.assertEqual(len(gateway.cancelled), 1)
+
+    def test_partial_cancel_status_53_also_reports_success(self):
+        gateway = FalseyCancelGateway(["53"])
+        redis_client, service = self._service(gateway)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertTrue(response["data"]["success"])
+
+    def test_terminal_filled_status_does_not_become_cancel_success(self):
+        gateway = FalseyCancelGateway(["56"])
+        redis_client, service = self._service(gateway)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertFalse(response["data"]["success"])
+        self.assertIn("reached status 56", response["data"]["message"])
+
+    def test_active_order_at_deadline_remains_cancel_failure(self):
+        gateway = FalseyCancelGateway(["50"])
+        redis_client, service = self._service(gateway, timeout=0.0)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertFalse(response["data"]["success"])
+        self.assertIn("is still status 50", response["data"]["message"])
+
+    def test_lookup_error_at_deadline_remains_cancel_failure(self):
+        gateway = FalseyCancelGateway(
+            ["54"], query_error=RuntimeError("QMT query unavailable"))
+        redis_client, service = self._service(gateway, timeout=0.0)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertFalse(response["data"]["success"])
+        self.assertIn("cancel status lookup failed", response["data"]["message"])
+
+    def test_truthy_native_return_verified_by_immediate_lookup(self):
+        # #151: truthy is no more trustworthy than falsey (a cancel of an
+        # order that does not exist returns success=True). The fast path
+        # survives, but only through one immediate status lookup -- not by
+        # believing the native return.
+        gateway = FalseyCancelGateway(["54"], native_success=True)
+        redis_client, service = self._service(gateway)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertTrue(response["data"]["success"])
+        self.assertEqual(gateway.lookups, 1)
+        self.assertEqual(service.pending_settlement_count(), 0)
+
+    def test_truthy_native_return_without_confirmation_is_not_success(self):
+        # The #151 shape exactly: native success=True, order still active
+        # at the deadline -> the reply must not be a bare success.
+        gateway = FalseyCancelGateway(["50"], native_success=True)
+        redis_client, service = self._service(gateway, timeout=0.0)
+        self._cancel(service)
+
+        service.drain_pending()
+
+        response = json.loads(
+            redis_client.kv["bigqmt:rpc:resp:acct:cancel-request-1"])
+        self.assertFalse(response["data"]["success"])
+        self.assertIn("is still status 50", response["data"]["message"])
 
 
 class AsyncOrderSettlementTest(unittest.TestCase):
@@ -858,6 +1058,27 @@ class RedisRpcTest(unittest.TestCase):
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-asset"])
         self.assertTrue(response["ok"], response["error"])
 
+    def test_listener_wildcard_defers_execution_snapshot_to_strategy_thread(self):
+        redis_client, service = _service_with_listener_methods(
+            process_in_listener=True,
+            listener_methods=("*",),
+        )
+
+        service.enqueue_payload(
+            {
+                "request_id": "queued-execution-snapshot",
+                "account_id": "acct",
+                "method": "query_execution_snapshot",
+                "params": {"order_strategy_name": "", "trade_strategy_name": ""},
+            }
+        )
+
+        response_key = "bigqmt:rpc:resp:acct:queued-execution-snapshot"
+        self.assertNotIn(response_key, redis_client.kv)
+        self.assertEqual(service.drain_pending(), 1)
+        response = json.loads(redis_client.kv[response_key])
+        self.assertTrue(response["ok"], response["error"])
+
     def test_account_mismatch_is_rejected(self):
         redis_client, service = _service()
 
@@ -1262,7 +1483,11 @@ class EmptySysidSettlementTest(unittest.TestCase):
         settlement = self._settlement()
         self.assertFalse(handlers._apply_order_lookup(settlement, final=False))
         self.assertTrue(handlers._apply_order_lookup(settlement, final=True))
-        self.assertIn("found by remark", settlement.server_error)
+        # [merge 2026-09-03] 文案随上游 #152 重锚: ORDER IS LIVE / DO NOT RESUBMIT,
+        # 意图不变 — 区分型错误, 不得落 "not found in system" 通用文案。
+        self.assertIn("ORDER IS LIVE", settlement.server_error)
+        self.assertIn("DO NOT RESUBMIT", settlement.server_error)
+        self.assertIn("by remark", settlement.server_error)
         self.assertNotIn("not found in system", settlement.server_error)
         self.assertIsNone(settlement.result.order_sys_id)
 
@@ -1285,6 +1510,49 @@ class EmptySysidSettlementTest(unittest.TestCase):
         settlement = self._settlement()
         self.assertTrue(handlers._apply_order_lookup(settlement, final=True))
         self.assertIn("not found in system", settlement.server_error)
+class ProbeCapabilitiesTest(unittest.TestCase):
+    """probe_capabilities：部署后只读探测 QMT 暴露的 callable。"""
+
+    def _handlers(self):
+        calls = []
+
+        def fake_credit(account_id):
+            calls.append(account_id)
+            return [{"a": 1}, {"b": 2}]
+
+        class _Ctx:
+            def get_full_tick(self, codes):
+                return {}
+
+            # get_market_data_ex 故意不提供，验证 False 分支
+
+        return BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=BigQmtMarketDataProvider(_Ctx()),
+            position_provider=FakePositionProvider(),
+            qmt_api={
+                "passorder": lambda *a: None,
+                "get_assure_contract": fake_credit,
+                "get_enable_short_contract": lambda a: (_ for _ in ()).throw(RuntimeError("no credit")),
+            },
+        )
+
+    def test_probe_reports_globals_context_and_credit(self):
+        info = self._handlers().handle("probe_capabilities", {})
+
+        self.assertTrue(info["qmt_globals"]["passorder"])
+        self.assertFalse(info["qmt_globals"]["cancel"])
+        self.assertTrue(info["contextinfo_methods"]["get_full_tick"])
+        self.assertFalse(info["contextinfo_methods"]["get_market_data_ex"])
+        # 信用探测：成功的带行数，报错的带原因，未绑定的标 unavailable
+        self.assertEqual(info["credit_probe"]["get_assure_contract"]["rows"], 2)
+        self.assertFalse(info["credit_probe"]["get_enable_short_contract"]["ok"])
+        self.assertIn("no credit", info["credit_probe"]["get_enable_short_contract"]["error"])
+        self.assertFalse(info["credit_probe"]["get_debt_contract"]["available"])
+
+    def test_probe_is_read_only_and_in_whitelist(self):
+        handlers = self._handlers()
+        self.assertIn("probe_capabilities", handlers.allowed_methods)
 
 
 if __name__ == "__main__":

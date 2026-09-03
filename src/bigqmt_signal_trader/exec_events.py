@@ -286,6 +286,7 @@ _RAW_SNAPSHOT_EXTRA_FIELDS = (
     "order_sysid",
     "order_sys_id",
     "trade_id",
+    "traded_price",
     "traded_id",
     "strategy_name",
     "strategyName",
@@ -368,11 +369,18 @@ def normalize_order_event(order, account_id=""):
         ),
         "traded_volume": _attr(order, ["m_nVolumeTraded", "traded_volume"]),
         "price": _attr(order, ["m_dLimitPrice", "price", "limit_price"]),
+        "traded_price": _attr(
+            order, ["m_dTradedPrice", "traded_price", "avg_traded_price"]
+        ),
         "status": _attr(order, ["m_nOrderStatus", "order_status", "status"]),
         "direction": direction,
         "action": _action_from_direction(direction),
         "offset_flag": _attr(order, ["m_nOffsetFlag", "offset_flag"]),
         "strategy_name": str(_attr(order, ["strategyName", "m_strStrategyName", "strategy_name"], "") or ""),
+        # QMT sometimes puts the name right on the object; usually absent and
+        # the publisher fills it from ContextInfo (issue #161).
+        "instrument_name": str(
+            _attr(order, ["m_strInstrumentName", "instrument_name"], "") or ""),
         "remark": str(_attr(order, ["m_strRemark", "order_remark", "remark", "user_order_id"], "") or ""),
         "user_order_id": str(_attr(order, ["m_strRemark", "user_order_id", "order_remark", "remark"], "") or ""),
         "opt_name": str(_attr(order, ["m_strOptName", "opt_name"], "") or ""),
@@ -416,6 +424,64 @@ def remember_order_identity(redis_client, account_id, user_order_id, strategy_na
     return payload
 
 
+def order_identity_map(redis_client, account_id, user_order_ids, limit=500):
+    """user_order_id -> remembered identity, for a whole result set at once.
+
+    QMT does not put the strategy name on the rows get_trade_detail_data
+    returns -- neither ORDER nor DEAL rows have m_strStrategyName (verified by
+    listing every attribute on a live terminal: 120 and 47 of them
+    respectively, and it is in neither). It filters BY strategy internally, but
+    it will not tell you what the name was.
+
+    For orders this bridge submitted, it is remembered here at submit time
+    (remember_order_identity), keyed by the user_order_id that goes out as the
+    order remark. So a query can put it back. Orders placed by hand in the
+    terminal have no remark and stay unattributed -- there is nothing to
+    recover.
+
+    One mget rather than N gets: this runs on the main strategy thread, where
+    every round trip is charged to the whole bridge.
+    """
+    wanted = []
+    seen = set()
+    for user_order_id in user_order_ids:
+        text = str(user_order_id or "").strip()
+        if text and text not in seen:
+            seen.add(text)
+            wanted.append(text)
+        if len(wanted) >= limit:
+            break
+    if not wanted or redis_client is None:
+        return {}
+
+    keys = [order_identity_key(account_id, text) for text in wanted]
+    raws = None
+    mget = getattr(redis_client, "mget", None)
+    if mget is not None:
+        try:
+            raws = mget(keys)
+        except Exception:
+            raws = None
+    if raws is None:
+        raws = []
+        for key in keys:
+            try:
+                raws.append(redis_client.get(key))
+            except Exception:
+                raws.append(None)
+
+    found = {}
+    for text, raw in zip(wanted, raws):
+        if not raw:
+            continue
+        try:
+            found[text] = json.loads(
+                raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw))
+        except Exception:
+            continue
+    return found
+
+
 def enrich_order_identity(redis_client, account_id, event):
     if redis_client is None or not isinstance(event, dict):
         return event
@@ -448,6 +514,8 @@ def normalize_trade_event(trade, account_id=""):
         "stock_code": _with_exchange_suffix(
             _attr(trade, ["m_strInstrumentID", "stock_code"], ""), trade
         ),
+        "instrument_name": str(
+            _attr(trade, ["m_strInstrumentName", "instrument_name"], "") or ""),
         "order_sys_id": str(_attr(trade, ["m_strOrderSysID", "order_sys_id", "order_sysid", "order_id"], "") or ""),
         "trade_id": str(_attr(trade, ["m_strTradeID", "trade_id"], "") or ""),
         "volume": _attr(trade, ["m_nVolume", "volume", "traded_volume"]),
@@ -473,6 +541,46 @@ def normalize_trade_event(trade, account_id=""):
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "created_at_ts": time.time(),
     }
+
+
+# Push-channel topics, used when exec events travel over the quote push channel
+# instead of Redis pub/sub. They mirror the Redis channel names minus the
+# account (a zmq PUB socket is already per-account).
+EXEC_TOPICS = {
+    EVENT_ORDER: "exec:order",
+    EVENT_TRADE: "exec:trade",
+    "order_error": "exec:order_error",
+    "cancel_error": "exec:cancel_error",
+}
+
+
+def exec_topic(event_type):
+    return EXEC_TOPICS.get(str(event_type or ""), "exec:order")
+
+
+def publish_exec_event(sink, account_id, event):
+    """Publish one exec event through whichever sink the deployment has.
+
+    ``sink`` is either a Redis client or a QuotePushChannel. Redis stays on the
+    original per-account channels (streams + pub/sub, so short replay keeps
+    working); a push channel gets one topic per event type.
+
+    Exec events used to be Redis-only, which meant a zmq deployment silently
+    received no order/trade callbacks at all (issue #76) -- the publish path
+    just returned when no Redis client could be built.
+    """
+    event_type = str((event or {}).get("event_type") or EVENT_ORDER)
+    if hasattr(sink, "publish") and not hasattr(sink, "xadd"):
+        # QuotePushChannel: publish(topic, data).
+        sink.publish(exec_topic(event_type), event)
+        return event
+    if event_type == EVENT_TRADE:
+        return publish_trade_event(sink, account_id, event)
+    if event_type == "order_error":
+        return publish_order_error_event(sink, account_id, event)
+    if event_type == "cancel_error":
+        return publish_cancel_error_event(sink, account_id, event)
+    return publish_order_event(sink, account_id, event)
 
 
 def _publish(redis_client, channel, event, maxlen=2000):

@@ -12,6 +12,7 @@ import os
 import sys
 import threading
 import time
+import traceback as _traceback
 
 # The DRYRUN entry reloads strategy/runtime/redis_rpc/redis_common but NOT the
 # other package submodules. Without this, the "from adapter_factory import build_app"
@@ -55,6 +56,59 @@ else:
         tick_app,
     )
     from bigqmt_signal_trader.runtime_bigqmt import BigQmtRuntimeAdapter
+
+
+# exec_events is loaded here, at module load, and never from inside the
+# order/deal callback. QMT runs those callbacks on a C++ thread entered via
+# PyGILState_Ensure; the first exec of a not-yet-imported module on such a
+# thread fails down in the C layer WITHOUT setting a Python exception, which
+# surfaces as SystemError "error return without exception set" (issue #76,
+# live repro 2026-08-27). Modules already in sys.modules resolve fine there --
+# which is why this only bites deployments where the init-time reload could not
+# preload it, i.e. the single-file QMT sandbox build.
+def _import_exec_events():
+    # In the QMT sandbox a package-level "from bigqmt_signal_trader import x"
+    # goes through the C-level __import__ and fails the same way; the local
+    # loader that already serves the adapter modules does not.
+    if _load_bridge_module is not None:
+        return _load_bridge_module("bigqmt_signal_trader.exec_events")
+    from bigqmt_signal_trader import exec_events
+
+    return exec_events
+
+
+def _load_exec_events():
+    try:
+        return _import_exec_events()
+    except Exception:
+        direct_error = _traceback.format_exc()
+    # Only reached when the direct load failed. A plain threading.Thread always
+    # has a full Python thread state, so the exec that just failed succeeds
+    # there; the import lock makes handing the result back safe.
+    holder = {}
+
+    def _target():
+        try:
+            holder["module"] = _import_exec_events()
+        except Exception:
+            pass
+
+    try:
+        worker = threading.Thread(target=_target)
+        worker.start()
+        worker.join()
+    except Exception:
+        pass
+    if holder.get("module") is not None:
+        return holder["module"]
+    print(
+        "[bigqmt_signal_trader] exec_events load failed; exec-event push is "
+        "disabled for this run:\n%s" % direct_error
+    )
+    return None
+
+
+_exec_events = _load_exec_events()
 
 
 _app_factory = None
@@ -135,6 +189,206 @@ def bind_qmt_api(passorder_func=None, cancel_func=None, get_trade_detail_data_fu
         for name, func in extra_funcs.items():
             if func is not None:
                 _qmt_api[name] = func
+
+
+# A reload asked for over RPC. Deferred to the adjust tick rather than done in
+# the handler, because reset_app() stops the very RPC service that is answering
+# the request -- the reply has to be sent first.
+# not_before: the reply to reload_deployment has to reach the client before the
+# transport it would travel on is torn down. Longer than the ZMQ ROUTER's
+# 1s RCVTIMEO, because that is how long its thread can sit in recv_multipart
+# before it loops back to _drain_response_queue and actually sends the reply.
+# _wait_for_responses_to_flush is the real guarantee; this is the floor.
+_RELOAD_GRACE_SECONDS = 1.5
+_RELOAD_FLUSH_TIMEOUT_SECONDS = 5.0
+_reload_request = {"pending": False, "requested_at": 0.0, "not_before": 0.0,
+                   "by": ""}
+_reload_result = {}
+
+
+def request_reload(reason=""):
+    """Schedule a package reload for the next adjust tick.
+
+    What it refreshes: everything under bigqmt_signal_trader/, by purging it
+    from sys.modules and re-running init(). That covers the adapters, the RPC
+    handlers, the models and the transports -- where nearly all changes land.
+
+    What it CANNOT refresh, and no amount of importlib will: this file and the
+    BIGQMT_REDIS_DRYRUN entry. QMT execs those itself, and a module cannot
+    reload the module it is running in. Those still need a strategy restart.
+
+    Deliberately explicit: reloading a live trading process is not free. QMT's
+    order/deal callbacks run on a C++ thread, and the first exec of a
+    not-yet-imported module there fails in the C layer without setting a Python
+    exception (SystemError: error return without exception set). The reload runs
+    on the adjust thread and the callback path holds its own reference to
+    exec_events from module load, so a callback landing mid-reload keeps using
+    the old module rather than importing anything -- but the window is real,
+    which is why this never fires on its own.
+    """
+    _reload_request["pending"] = True
+    _reload_request["requested_at"] = time.time()
+    _reload_request["not_before"] = time.time() + _RELOAD_GRACE_SECONDS
+    _reload_request["by"] = str(reason or "")
+    return {
+        "scheduled": True,
+        "note": "reload runs on the next adjust tick; poll get_deployment_info "
+                "or reload_status to see the result",
+        "version_before": _package_version(),
+    }
+
+
+def reload_status():
+    """The outcome of the last reload, or what is still pending."""
+    status = dict(_reload_result)
+    status["pending"] = bool(_reload_request["pending"])
+    status["requested_at"] = _reload_request["requested_at"]
+    return status
+
+
+def _package_version():
+    try:
+        if _load_bridge_module is not None:
+            module = _load_bridge_module("bigqmt_signal_trader.version")
+        else:
+            from bigqmt_signal_trader import version as module
+        return str(getattr(module, "__version__", ""))
+    except Exception:
+        return ""
+
+
+def _purge_package_modules():
+    """Drop every bigqmt_signal_trader module so the next import reads source.
+
+    Purging beats importlib.reload here: reload has to run in dependency order
+    (order_bigqmt does `from ..models import OrderSnapshot` at import time, so
+    reloading models after it leaves the old class bound), and getting that
+    order wrong fails silently. A purge has no order.
+    """
+    names = [name for name in list(sys.modules)
+             if name == "bigqmt_signal_trader"
+             or name.startswith("bigqmt_signal_trader.")]
+    for name in names:
+        sys.modules.pop(name, None)
+    return sorted(names)
+
+
+def _rebind_module_level_imports():
+    """Re-point the names this module bound at import time.
+
+    Purging sys.modules does nothing for references already held here --
+    _default_build_app, the runner functions, BigQmtRuntimeAdapter and
+    _exec_events would all keep pointing at the old objects, and the reload
+    would look like it worked while changing nothing.
+    """
+    global _adapter_factory, _runner, _runtime_bigqmt, _default_build_app
+    global forward_order_event, forward_trade_event, init_app, _reset_runner_app
+    global sync_positions_app, tick_app, BigQmtRuntimeAdapter, _exec_events
+
+    if _load_bridge_module is not None:
+        _adapter_factory = _load_bridge_module("bigqmt_signal_trader.adapter_factory")
+        _runner = _load_bridge_module("bigqmt_signal_trader.runner")
+        _runtime_bigqmt = _load_bridge_module("bigqmt_signal_trader.runtime_bigqmt")
+        _default_build_app = _adapter_factory.build_app
+        forward_order_event = _runner.forward_order_event
+        forward_trade_event = _runner.forward_trade_event
+        init_app = _runner.init_app
+        _reset_runner_app = _runner.reset_app
+        sync_positions_app = _runner.sync_positions_app
+        tick_app = _runner.tick_app
+        BigQmtRuntimeAdapter = _runtime_bigqmt.BigQmtRuntimeAdapter
+    else:
+        from bigqmt_signal_trader.adapter_factory import build_app as _bp
+        from bigqmt_signal_trader import runner as _rn
+        from bigqmt_signal_trader.runtime_bigqmt import BigQmtRuntimeAdapter as _ra
+
+        _default_build_app = _bp
+        forward_order_event = _rn.forward_order_event
+        forward_trade_event = _rn.forward_trade_event
+        init_app = _rn.init_app
+        _reset_runner_app = _rn.reset_app
+        sync_positions_app = _rn.sync_positions_app
+        tick_app = _rn.tick_app
+        BigQmtRuntimeAdapter = _ra
+    _exec_events = _load_exec_events()
+
+
+def _pending_response_count():
+    """How many RPC replies the transport has queued but not yet sent."""
+    transport = getattr(_rpc_service, "_transport", None) if _rpc_service else None
+    pending = getattr(transport, "_response_queue", None)
+    if pending is None:
+        return 0
+    try:
+        return pending.qsize()
+    except Exception:
+        return 0
+
+
+def _wait_for_responses_to_flush(timeout_seconds=None):
+    """Let the transport send what is queued before reset_app() tears it down.
+
+    The reply to reload_deployment is put on the ZMQ transport's response queue
+    by the handler, and the ROUTER thread sends it at the top of its next loop
+    -- a loop that can be sitting in recv_multipart for up to RCVTIMEO (1s),
+    and that needs the GIL this thread is holding. Sleeping yields both.
+
+    Sending from here instead is not an option: the ROUTER socket belongs to
+    that thread and ZMQ sockets are not thread-safe -- the same reason it closes
+    its own socket in its finally block.
+
+    Without this the reload SUCCEEDS and the caller still sees a timeout, which
+    is indistinguishable from a reload that killed the bridge. That is what the
+    first two live attempts did: "responded method=reload_deployment ok=True"
+    and "[bigqmt_reload] ok purged=28" in the terminal, TransportTimeout at the
+    client.
+    """
+    if timeout_seconds is None:
+        timeout_seconds = _RELOAD_FLUSH_TIMEOUT_SECONDS
+    deadline = time.time() + max(0.0, timeout_seconds)
+    while time.time() < deadline:
+        if _pending_response_count() == 0:
+            # qsize() drops when the sender dequeues, which is just BEFORE the
+            # send. One more yield so that send completes.
+            time.sleep(0.2)
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _perform_reload(context_info):
+    """Purge, re-import, re-init. Runs on the adjust thread."""
+    global _reload_result
+    _reload_request["pending"] = False
+    started = time.time()
+    before = _package_version()
+    result = {"ok": False, "version_before": before, "version_after": "",
+              "modules_purged": 0, "seconds": 0.0, "error": "",
+              "replies_flushed": False, "by": _reload_request["by"]}
+    try:
+        result["replies_flushed"] = _wait_for_responses_to_flush()
+        if not result["replies_flushed"]:
+            print("[bigqmt_reload] WARNING: %d reply/replies still queued after "
+                  "%.0fs; the caller may see a timeout even though the reload "
+                  "runs" % (_pending_response_count(),
+                            _RELOAD_FLUSH_TIMEOUT_SECONDS))
+        reset_app()
+        result["modules_purged"] = len(_purge_package_modules())
+        _rebind_module_level_imports()
+        init(context_info)
+        result["version_after"] = _package_version()
+        result["ok"] = True
+    except Exception as exc:
+        result["error"] = "%s: %s" % (type(exc).__name__, exc)
+        _log_err("reload", "reload failed: %s\n%s"
+                          % (exc, _traceback.format_exc()))
+    result["seconds"] = round(time.time() - started, 3)
+    _reload_result = result
+    print("[bigqmt_reload] %s purged=%d %s -> %s in %.2fs%s"
+          % ("ok" if result["ok"] else "FAILED", result["modules_purged"],
+             before or "?", result["version_after"] or "?", result["seconds"],
+             "" if result["ok"] else "  (" + result["error"] + ") -- RESTART THE STRATEGY"))
+    return result
 
 
 def reset_app():
@@ -254,6 +508,32 @@ _EXTRA_QMT_GLOBAL_FUNCS = (
     # reads only ever return the latest day.
     "down_history_data",
 )
+
+# The full set of QMT-injected global function names (the three trade entry
+# points plus the extras above). Mount sites (the RPC runtime's direct mount)
+# capture whatever is callable from their own exec namespace via
+# capture_qmt_injected_funcs() -- this is the single source for that list; do
+# not hand-copy the names elsewhere.
+_QMT_INJECTED_GLOBAL_FUNCS = (
+    "passorder", "cancel", "get_trade_detail_data",
+) + _EXTRA_QMT_GLOBAL_FUNCS
+
+
+def capture_qmt_injected_funcs(namespace):
+    """Capture QMT-injected global funcs from a mounted entry's exec namespace.
+
+    QMT mounts an entry file by exec and injects these functions into THAT
+    namespace only -- the strategy module's globals/builtins lookups cannot
+    see them -- so a mounted entry must pass its own globals() here and feed
+    the result to bind_qmt_api(extra_funcs=...). Non-callables are skipped,
+    so a plain import namespace binds nothing.
+    """
+    captured = {}
+    for name in _QMT_INJECTED_GLOBAL_FUNCS:
+        func = (namespace or {}).get(name)
+        if callable(func):
+            captured[name] = func
+    return captured
 
 
 def _build_config():
@@ -436,8 +716,40 @@ def _build_rpc_service(context_info, app, config):
         settle_orders_inline=_config_bool(rpc_config.get("settle_orders_inline"), False),
         order_settle_timeout_seconds=float(rpc_config.get("order_settle_timeout_seconds", 3.0)),
         quote_subscription_manager=quote_manager,
+        # .get(key) not .get(key, default): "" is a real answer here (leave
+        # 报单来源 blank), and a default would swallow it -- issue #154.
+        default_strategy_name=rpc_config.get("default_strategy_name"),
     )
-    handlers.download_job_redis_client = response_redis_client or redis_client
+    # Neither of these may depend on the TRANSPORT. Only a redis transport
+    # builds the two clients above, so on zmq both were None -- and each had a
+    # working counterpart on the other side of that None:
+    #
+    #   download jobs   _pump_download_jobs advances queued jobs on every
+    #                   adjust tick and takes its client from _exec_event_redis,
+    #                   so on zmq the worker ran while submit / get_status /
+    #                   wait answered "download jobs require a Redis client".
+    #                   The worker was running and the door was locked.
+    #   order identity  orders were never remembered at submit time, so a query
+    #                   could never put the strategy name back (issue #133).
+    #
+    # _exec_event_redis is the helper that already covers this case ("only
+    # builds a client when _rpc_service has none, which is the zmq-transport
+    # case") and caches it -- its docstring says what building one per call
+    # cost. No redis configured at all leaves both None, and both stores treat
+    # that as "feature off", never as an error.
+    _store_redis = response_redis_client or redis_client or _exec_event_redis(config)
+    handlers.download_job_redis_client = _store_redis
+    handlers.order_identity_redis_client = _store_redis
+    # Whether _pump_download_jobs will actually run queued jobs. The submit RPC
+    # needs it: with the redis client now wired on every transport, a submit
+    # would otherwise be accepted into a queue that nothing drains.
+    # Lets reload_deployment re-import the package and re-run init without a
+    # strategy restart. The handlers cannot reach this module's own functions
+    # any other way.
+    handlers.reload_hook = request_reload
+    handlers.reload_status_hook = reload_status
+    handlers.download_jobs_enabled = _config_bool(
+        (config.get("download_jobs") or {}).get("enabled"), False)
     handlers.download_job_chunk_size = int((config.get("download_jobs") or {}).get("chunk_size") or 10)
     handlers.download_job_ttl_seconds = int((config.get("download_jobs") or {}).get("job_ttl_seconds") or 3600)
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
@@ -785,6 +1097,10 @@ def init(ContextInfo):
 
     # 启动时自动诊断：检测服务状态 + 关键函数绑定，方便发现问题
     _diag_startup(ContextInfo, config)
+    try:
+        _start_context_warmup(ContextInfo, config)
+    except Exception as exc:
+        _log_startup_error("context warmup failed to start: %s" % exc)
     return app
 
 
@@ -1104,6 +1420,102 @@ def _push_quote_updates(context_info, config):
         except Exception as exc:
             print("[bigqmt_quote_events] seq=%s push failed: %s" % (seq_val, exc))
     return pushed
+# ContextInfo families whose FIRST call after a restart can cost minutes.
+#
+# get_full_tick is already exercised by _diag_startup, on the main thread, and
+# comes back in milliseconds. get_financial_data is not, and it was measured at
+# 346 SECONDS on its first call after a restart -- while QMT itself was healthy
+# (whole-quote data flowing, threadpool alive) and the main strategy thread was
+# idle. Every later call that day took under a second, including codes and
+# tables never asked for before, so it is a one-time cost and not a per-code
+# cache miss.
+#
+# That block lands on the RPC listener thread, which serves one request at a
+# time, so it takes the whole bridge down with it: every queued request times
+# out and the client sees a dead bridge.
+#
+# Warming does not make the cost cheaper. It moves it to a known moment, onto a
+# thread nobody is waiting on, with a log line saying what is happening --
+# instead of arriving as an unexplained freeze the first time a caller asks.
+#
+# Deliberately NOT on the main thread: _diag_startup runs there during init, and
+# a 346-second call in init would freeze startup before the adjust timer is even
+# scheduled -- worse than the problem.
+def _warm_financial_data(context_info):
+    """Fetch a real slice, not an empty one.
+
+    An EMPTY date range is accepted and returns None instantly. The first
+    version of this warmup passed "" for both and reported "warm in 0.00s"
+    while exercising nothing at all -- a warmup that silently no-ops is worse
+    than none, because the log says it worked. Measured against the live
+    terminal, same code and stock:
+
+        dotted field + real range   0.75s  DataFrame rows=159
+        dotted field + empty range  0.17s  None
+        whole table  + real range   0.41s  DataFrame rows=159
+        whole table  + empty range  0.20s  Series rows=6
+    """
+    end = datetime.date.today()
+    start = end - datetime.timedelta(days=365)
+    return context_info.get_financial_data(
+        ["CAPITALSTRUCTURE.total_capital"], ["000001.SZ"],
+        start.strftime("%Y%m%d"), end.strftime("%Y%m%d"), "report_time")
+
+
+CONTEXT_WARMUP_PROBES = (
+    ("get_financial_data", _warm_financial_data),
+)
+
+
+def _warmup_row_count(result):
+    """How much a probe brought back, or -1 when that cannot be told."""
+    if result is None:
+        return 0
+    try:
+        return len(result)
+    except Exception:
+        return -1
+
+
+def _context_warmup_loop(context_info):
+    for name, probe in CONTEXT_WARMUP_PROBES:
+        started = time.time()
+        print("[bigqmt_warmup] %s: first call after a restart can take "
+              "minutes; running it now so a caller does not have to wait" % name)
+        try:
+            result = probe(context_info)
+            elapsed = time.time() - started
+        except Exception as exc:
+            print("[bigqmt_warmup] %s failed after %.1fs: %s"
+                  % (name, time.time() - started, str(exc)[:120]))
+            continue
+        rows = _warmup_row_count(result)
+        if rows == 0:
+            # Warming nothing while reporting success is the failure mode this
+            # check exists to catch; it already happened once.
+            print("[bigqmt_warmup] %s returned NOTHING in %.2fs -- the probe "
+                  "did not exercise the path it is meant to warm, so the "
+                  "first real caller will still pay the wait" % (name, elapsed))
+        elif elapsed > 10.0:
+            print("[bigqmt_warmup] %s warm after %.1fs (%s rows) -- that wait "
+                  "is now paid; callers should see sub-second responses"
+                  % (name, elapsed, rows))
+        else:
+            print("[bigqmt_warmup] %s warm in %.2fs (%s rows)"
+                  % (name, elapsed, rows))
+
+
+def _start_context_warmup(context_info, config):
+    """Kick the warmup onto a daemon thread. Never blocks init."""
+    flag = dict(config.get("rpc") or {}).get("warm_context_data", True)
+    if isinstance(flag, str):
+        flag = flag.strip().lower() not in ("0", "false", "no", "off", "")
+    if not flag:
+        return
+    thread = threading.Thread(
+        target=_context_warmup_loop, args=(context_info,),
+        name="bigqmt-context-warmup", daemon=True)
+    thread.start()
 
 
 def _pump_download_jobs(context_info, config):
@@ -1114,14 +1526,20 @@ def _pump_download_jobs(context_info, config):
     account_id = str(job_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         return None
-    redis_client = getattr(_rpc_service, "redis", None)
+    # Reuse one client. This runs on every adjust tick, so building a client
+    # here leaked one connection pool per tick -- at a 100ms interval that is
+    # ten per second. The symptom is easy to miss: the pools are garbage
+    # collected, and redis-py's __del__ then raises
+    # "AttributeError: 'Redis' object has no attribute 'connection'", which
+    # Python swallows as "Exception ignored in". It never reaches a log the
+    # package writes; it only shows up in the QMT panel.
+    #
+    # _exec_event_redis already learned this lesson and caches; this path was
+    # missed. Both only build a client when _rpc_service has none, which is the
+    # zmq-transport case.
+    redis_client = _exec_event_redis(config)
     if redis_client is None:
-        redis_config = dict(config.get("redis") or {})
-        if not redis_config:
-            return None
-        from bigqmt_signal_trader.adapters.redis_common import build_redis_client
-
-        redis_client = build_redis_client(redis_config)
+        return None
     market_data = getattr(getattr(_rpc_service, "handlers", None), "market_data", None)
     if market_data is None:
         from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
@@ -1175,6 +1593,15 @@ def adjust(ContextInfo, _source="timer"):
     _record_adjust_source(_source)
     config = _build_config()
     _adjust_phase("drain", _drain_rpc_service, config)
+    _adjust_phase("exec_hold", _flush_held_presysid_orders, config)
+    # AFTER the drain, and not on the tick that scheduled it. The drain is what
+    # flushes queued RPC responses, and reset_app() tears the transport down
+    # with any reply still in it -- reloading first killed the reply to
+    # reload_deployment itself, which the server had already logged as
+    # "responded ok=True" while the client sat there until it timed out.
+    if _reload_request["pending"] and time.time() >= _reload_request["not_before"]:
+        _adjust_phase("reload", _perform_reload, ContextInfo)
+        return None
     _adjust_phase("full_tick", _refresh_full_tick_cache, ContextInfo, config)
     _adjust_phase("quote_push", _push_quote_updates, ContextInfo, config)
     _adjust_phase("download", _pump_download_jobs, ContextInfo, config)
@@ -1207,12 +1634,219 @@ def handlebar(ContextInfo):
     return adjust(ContextInfo, _source="handlebar")
 
 
+# Redis is preferred for exec events, but only while it actually works.
+# "Configured" is not "reachable": redis-py builds a client lazily and does not
+# dial until the first command, so a stale redis block in the config yields a
+# perfectly good-looking client that times out on every publish -- and the zmq
+# push channel sitting right next to it never gets used (issue #145).
+_EXEC_REDIS_FAILURE_LIMIT = 3
+_exec_sink_state = {"redis_failures": 0, "reports": 0, "demoted": False}
+
+# issue #161: QMT fires the order callback once when the order row appears and
+# again when m_strOrderSysID is populated (#152's window) -- the client then
+# logs two identical 已报 events, the first degenerate (no sysid, order_id=0).
+# A sysid-less order event is held for a short window; if its sysid-bearing
+# twin arrives the held one is dropped, otherwise the adjust tick publishes it.
+_held_presysid_orders = {}      # key -> (event, held_at, raw_obj)
+_HELD_PRESYSID_DEFAULT_SECONDS = 0.8
+_instrument_name_cache = {}     # stock_code -> name (only non-empty cached)
+
+
+def _presysid_key(event):
+    """Identity for pairing a sysid-less event with its sysid-bearing twin."""
+    remark = str(event.get("user_order_id") or event.get("remark") or "").strip()
+    if remark:
+        return ("remark", remark)
+    stock = str(event.get("stock_code") or "")
+    if not stock:
+        return None  # cannot key safely -- publish immediately
+    return ("fields", (
+        stock, event.get("price"),
+        event.get("volume") or event.get("order_volume"),
+        event.get("direction"),
+    ))
+
+
+def _hold_presysid_order(event, event_config, raw_obj=None):
+    """Hold a sysid-less order event instead of publishing it. True if held."""
+    if str(event.get("order_sys_id") or ""):
+        return False
+    hold_s = float(event_config.get("hold_presysid_order_seconds",
+                                    _HELD_PRESYSID_DEFAULT_SECONDS) or 0)
+    if hold_s <= 0:
+        return False
+    key = _presysid_key(event)
+    if key is None:
+        return False
+    _held_presysid_orders[key] = (event, time.time(), raw_obj)
+    return True
+
+
+def _drop_held_presysid_twin(event):
+    """A sysid-bearing event supersedes its held sysid-less twin."""
+    if not str(event.get("order_sys_id") or ""):
+        return
+    key = _presysid_key(event)
+    if key is not None:
+        _held_presysid_orders.pop(key, None)
+
+
+def _flush_held_presysid_orders(config):
+    """Publish held events whose window expired. Runs on the adjust tick."""
+    if not _held_presysid_orders:
+        return
+    event_config = dict(config.get("exec_events") or {})
+    hold_s = float(event_config.get("hold_presysid_order_seconds",
+                                    _HELD_PRESYSID_DEFAULT_SECONDS) or 0)
+    now = time.time()
+    expired = [key for key, entry in _held_presysid_orders.items()
+               if now - entry[1] >= hold_s]
+    if not expired:
+        return
+    exec_events = _exec_events
+    account_id = str(event_config.get("account_id") or config.get("account_id")
+                     or _account_id or "")
+    sink = _exec_event_sink(config)
+    if exec_events is None or sink is None or not account_id:
+        for key in expired:
+            _held_presysid_orders.pop(key, None)
+        return
+    for key in expired:
+        entry = _held_presysid_orders.pop(key, None)
+        if entry is None:
+            continue
+        event, _held_at, raw_obj = entry
+        _publish_one(exec_events, sink, account_id, event, "order", config)
+        try:
+            status = int(event.get("status") or 0)
+        except (TypeError, ValueError):
+            status = 0
+        if status == 57:
+            # the held event turns out to be a junk: it still owes the
+            # order_error twin the non-held path would have published.
+            _publish_one(exec_events, sink, account_id,
+                         exec_events.normalize_order_error_event(raw_obj, account_id),
+                         "order_error", config)
+
+
+def _event_instrument_name(context_info, stock_code):
+    """Resolve the instrument name for an event, cached; empty never cached."""
+    code = str(stock_code or "")
+    if not code:
+        return ""
+    cached = _instrument_name_cache.get(code)
+    if cached:
+        return cached
+    name = ""
+    getter = getattr(context_info, "get_stock_name", None) if context_info is not None else None
+    if getter is not None:
+        try:
+            name = str(getter(code) or "")
+        except Exception:
+            name = ""
+    if name:
+        _instrument_name_cache[code] = name
+    return name
+
+
+def _push_channel_sink():
+    if _quote_subscription_service is None:
+        return None
+    try:
+        return _quote_subscription_service[1]          # (manager, channel)
+    except Exception:
+        return None
+
+
+def _exec_event_sink(config):
+    """Where exec events go: a Redis client, or the quote push channel.
+
+    Exec events were Redis-only, so a zmq deployment with no Redis configured
+    silently delivered no order/trade callbacks at all -- _publish_exec_event
+    simply returned (issue #76). zmq deployments already run a push channel for
+    whole-quote data, so reuse it rather than opening a second socket.
+
+    Redis stays first *while it works*: its channels carry streams for short
+    replay, which the push channel has no equivalent of. After
+    _EXEC_REDIS_FAILURE_LIMIT consecutive publish failures it is demoted and
+    the push channel takes over, because an unreachable redis was otherwise
+    swallowing every callback while a working channel stood idle (issue #145).
+    """
+    if not _exec_sink_state["demoted"]:
+        redis_client = _exec_event_redis(config)
+        if redis_client is not None:
+            return redis_client
+    return _push_channel_sink()
+
+
+def _note_exec_publish_failure(kind, exc):
+    """Count a failure, demote redis once it is clearly not coming back, and
+    keep the log readable.
+
+    The full traceback is deliberate -- issue #76 took a day because str(exc)
+    alone read "error return without exception set" with no origin. But a
+    persistently unreachable redis prints that for EVERY order and deal, which
+    buries the log it is meant to explain. Full detail the first few times,
+    a one-liner after that.
+    """
+    state = _exec_sink_state
+    state["redis_failures"] += 1
+    state["reports"] += 1
+    if state["reports"] <= 3:
+        _log_err(
+            "exec_events",
+            "publish %s failed: %s (%s)\n%s"
+            % (kind, exc, exc.__class__.__name__, _traceback.format_exc()),
+        )
+    elif state["reports"] % 50 == 0:
+        _log_err(
+            "exec_events",
+            "publish %s still failing after %d attempts: %s (%s)"
+            % (kind, state["reports"], exc, exc.__class__.__name__),
+        )
+    if not state["demoted"] and state["redis_failures"] >= _EXEC_REDIS_FAILURE_LIMIT:
+        state["demoted"] = bool(_push_channel_sink())
+        if state["demoted"]:
+            print("[bigqmt_exec_events] redis failed %d times in a row; switching "
+                  "to the quote push channel for order/trade callbacks. Remove the "
+                  "redis block from the local config to skip this entirely."
+                  % state["redis_failures"])
+
+
+def _publish_one(exec_events, sink, account_id, event, kind, config):
+    """Publish one event, falling back to the push channel if the sink fails.
+
+    Without the fallback a failed publish simply lost the callback -- the
+    client never learns the order happened. Trying the other channel costs one
+    extra attempt and only on the failure path.
+    """
+    try:
+        exec_events.publish_exec_event(sink, account_id, event)
+        _exec_sink_state["redis_failures"] = 0
+        return True
+    except Exception as exc:
+        _note_exec_publish_failure(kind, exc)
+    fallback = _push_channel_sink()
+    if fallback is None or fallback is sink:
+        return False
+    try:
+        exec_events.publish_exec_event(fallback, account_id, event)
+        return True
+    except Exception as exc:
+        _note_exec_publish_failure("%s (push fallback)" % kind, exc)
+        return False
+
+
 def _exec_event_redis(config):
     """Return a redis client for exec-event publishing, reusing one instance.
 
     Previously a new client was built per order/trade callback when the RPC
     service had none (the zmq-transport case), leaking a connection pool per
     event. Reuse one; build failure returns None so publishing just skips.
+
+    A non-Redis transport may retain a Redis block for optional download jobs
+    or exec-event replay. Skip that block only when both consumers are
+    explicitly disabled; omitted flags retain the legacy enabled behavior.
     """
     global _exec_event_redis_client
     existing = getattr(_rpc_service, "redis", None) if _rpc_service is not None else None
@@ -1220,6 +1854,10 @@ def _exec_event_redis(config):
         return existing
     if _exec_event_redis_client is not None:
         return _exec_event_redis_client
+    if not _config_bool((config.get("download_jobs") or {}).get("enabled"), True) and not _config_bool(
+        (config.get("exec_events") or {}).get("enabled"), True
+    ):
+        return None
     redis_config = dict(config.get("redis") or {})
     if not redis_config:
         return None
@@ -1227,12 +1865,20 @@ def _exec_event_redis(config):
         from bigqmt_signal_trader.adapters.redis_common import build_redis_client
 
         _exec_event_redis_client = build_redis_client(redis_config)
-    except Exception:
+    except Exception as exc:
+        # 静默 None 会让事件悄悄全丢（issue #71 的 protocol 崩溃就是这样没的），
+        # 必须留痕。
+        try:
+            from bigqmt_signal_trader.logging_setup import get_logger
+
+            get_logger("strategy").error("exec-event redis client build failed: %s", exc)
+        except Exception:
+            pass
         return None
     return _exec_event_redis_client
 
 
-def _publish_exec_event(kind, obj):
+def _publish_exec_event(kind, obj, context_info=None):
     """Push a normalized order/trade event to Redis for real-time client callbacks."""
     config = _build_config()
     event_config = dict(config.get("exec_events") or {})
@@ -1240,10 +1886,12 @@ def _publish_exec_event(kind, obj):
     # enabled/account_id early returns), because the point is to observe the
     # object exactly as QMT handed it over — even when publishing is off.
     raw_fields = None
+    exec_events = _exec_events
+    if exec_events is None:
+        # Already reported once at module load; a per-callback log would flood.
+        return
     if _config_bool(event_config.get("debug_raw_fields"), False):
         try:
-            from bigqmt_signal_trader import exec_events
-
             print(exec_events.format_raw_snapshot(kind, obj))
             raw_fields = exec_events.raw_field_snapshot(obj)
         except Exception as exc:
@@ -1253,23 +1901,40 @@ def _publish_exec_event(kind, obj):
     account_id = str(event_config.get("account_id") or config.get("account_id") or _account_id or "")
     if not account_id:
         return
-    redis_client = _exec_event_redis(config)
-    if redis_client is None:
+    sink = _exec_event_sink(config)
+    if sink is None:
         return
     try:
-        from bigqmt_signal_trader import exec_events
-
         if kind == "trade":
             event = exec_events.normalize_trade_event(obj, account_id)
+            if not event.get("instrument_name"):
+                event["instrument_name"] = _event_instrument_name(
+                    context_info, event.get("stock_code"))
             if raw_fields:
                 event["raw_fields"] = raw_fields
-            exec_events.publish_trade_event(redis_client, account_id, event)
+            _publish_one(exec_events, sink, account_id, event, kind, config)
         else:
             event = exec_events.normalize_order_event(obj, account_id)
-            event = exec_events.enrich_order_identity(redis_client, account_id, event)
+            # Identity enrichment reads the remark->identity map that
+            # remember_order_identity wrote, which only exists in Redis. On a
+            # push channel the event goes out un-enriched rather than not at
+            # all; order_sys_id and remark are already on it.
+            redis_client = _exec_event_redis(config)
+            if redis_client is not None:
+                event = exec_events.enrich_order_identity(redis_client, account_id, event)
+            if not event.get("instrument_name"):
+                event["instrument_name"] = _event_instrument_name(
+                    context_info, event.get("stock_code"))
+            # QMT fires this callback once with the row pre-sysid and again
+            # once the id lands (#152's window) -- two identical 已报 events,
+            # the first degenerate (issue #161). Hold the sysid-less one; the
+            # twin drops it, the adjust flush publishes it if no twin comes.
+            if _hold_presysid_order(event, event_config, obj):
+                return
+            _drop_held_presysid_twin(event)
             if raw_fields:
                 event["raw_fields"] = raw_fields
-            exec_events.publish_order_event(redis_client, account_id, event)
+            _publish_one(exec_events, sink, account_id, event, kind, config)
             # 废单 (status=57 ENTRUST_STATUS_JUNK) 推送 order_error，让客户端
             # on_order_error 能感知下单被拒。
             try:
@@ -1280,20 +1945,29 @@ def _publish_exec_event(kind, obj):
                 err_event = exec_events.normalize_order_error_event(obj, account_id)
                 if raw_fields:
                     err_event["raw_fields"] = raw_fields
-                exec_events.publish_order_error_event(redis_client, account_id, err_event)
+                _publish_one(exec_events, sink, account_id, err_event,
+                             "order_error", config)
     except Exception as exc:
-        _log_err("exec_events", "publish %s failed: %s" % (kind, exc))
+        # Publishing itself is handled (and throttled) inside _publish_one, so
+        # anything reaching here came from normalizing the QMT object. str(exc)
+        # alone reads "error return without exception set" with no hint of where
+        # it came from -- that is what made issue #76 take a day to pin down.
+        _log_err(
+            "exec_events",
+            "building the %s event failed: %s (%s)\n%s"
+            % (kind, exc, exc.__class__.__name__, _traceback.format_exc()),
+        )
 
 
 def order_callback(ContextInfo, orderInfo):
     """Standard Big QMT order callback."""
-    _publish_exec_event("order", orderInfo)
+    _publish_exec_event("order", orderInfo, ContextInfo)
     return forward_order_event(BigQmtRuntimeAdapter.to_order_event(orderInfo))
 
 
 def deal_callback(ContextInfo, dealInfo):
     """Standard Big QMT deal callback."""
-    _publish_exec_event("trade", dealInfo)
+    _publish_exec_event("trade", dealInfo, ContextInfo)
     return forward_trade_event(BigQmtRuntimeAdapter.to_trade_event(dealInfo))
 
 

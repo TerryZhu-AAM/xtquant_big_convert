@@ -5,21 +5,25 @@ def __getattr__(name):
     return getattr(_compat.xtdata, name)
 
 
-def get_full_tick(code_list, timeout_seconds=None):
+def get_full_tick(code_list, timeout_seconds=None, types=None):
     # [compat v0.2.6] 增 timeout_seconds (单次 RPC 超时, 长代码列表分段时使用)
     # 与 BigQmtXtData.get_full_tick 同款签名, ShimSignatureParityTest 全量锁.
-    return _compat.xtdata.get_full_tick(code_list, timeout_seconds)
+    # [merge 2026-09-03] 上游 0.3.x 增 types 透传 (原生 xtdata.get_full_tick
+    # 的 types 形参对齐), 同款签名随动。
+    return _compat.xtdata.get_full_tick(code_list, timeout_seconds, types)
 
 
 def get_market_data(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True):
     return _compat.xtdata.get_market_data(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data)
 
 
-def get_market_data_ex(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True, chunk_size=None, timeout_seconds=None):
+def get_market_data_ex(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True, chunk_size=None, timeout_seconds=None, use_formula=True):
     # [compat v0.2.6] 增 chunk_size (分段大小, issue #47 RPC timeout 共享问题)
     # + timeout_seconds (单批 RPC 超时), 与 BigQmtXtData.get_market_data_ex 同款签名.
     # ShimSignatureParityTest 全量锁.
-    return _compat.xtdata.get_market_data_ex(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data, chunk_size, timeout_seconds)
+    # [merge 2026-09-03] 上游 0.3.x 增 use_formula (订阅推送必须拿最新数据时关
+    # FormulaServer 快照旁路), 同款签名随动。
+    return _compat.xtdata.get_market_data_ex(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data, chunk_size, timeout_seconds, use_formula)
 
 
 def get_local_data(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True, data_dir=None):
@@ -55,8 +59,28 @@ def get_stock_list_in_sector(sector_name, real_timetag=-1):
     return _compat.xtdata.get_stock_list_in_sector(sector_name, real_timetag=real_timetag)
 
 
-def get_sector_list():
-    return _compat.xtdata.get_sector_list()
+def get_sector_list(allow_fallback=False):
+    return _compat.xtdata.get_sector_list(allow_fallback=allow_fallback)
+
+
+def create_sector(sector_name, stock_list):
+    return _compat.xtdata.create_sector(sector_name, stock_list)
+
+
+def create_sector_folder(parent_node, folder_name, overwrite=False):
+    return _compat.xtdata.create_sector_folder(parent_node, folder_name, overwrite)
+
+
+def reset_sector_stock_list(sector, stock_list):
+    return _compat.xtdata.reset_sector_stock_list(sector, stock_list)
+
+
+def add_stock_to_sector(sector, stock_code):
+    return _compat.xtdata.add_stock_to_sector(sector, stock_code)
+
+
+def remove_stock_from_sector(sector, stock_code):
+    return _compat.xtdata.remove_stock_from_sector(sector, stock_code)
 
 
 def get_sector_info(sector_name=""):
@@ -150,6 +174,15 @@ def download_history_data2(stock_list, period, start_time="", end_time="", callb
 
 def get_trading_dates(market, start_time="", end_time="", count=-1):
     return _compat.xtdata.get_trading_dates(market, start_time, end_time, count)
+
+
+def get_stock_type(stock_code, variety_list=None):
+    # 走包装而不是 call_method：包装里写了为什么这个方法在大 QMT 上答不了
+    # （ContextInfo stub 对任何代码都返回 0）。两条路径必须一致，否则
+    # 顶层 xtdata 还会把那个 0 递给调用方。
+    # [merge 2026-09-03] 上游 0.3.x 增 variety_list 透传 (期货/期权品种判定),
+    # 同款签名随动; 首参名随 compat 对齐为 stock_code (parity 锁精确名匹配)。
+    return _compat.xtdata.get_stock_type(stock_code, variety_list)
 
 
 def get_holidays():

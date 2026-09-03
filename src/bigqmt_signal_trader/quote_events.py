@@ -60,7 +60,7 @@ def should_send_heartbeat(last_sent_ts, now_ts, interval_seconds):
 # ── [BUG-20260827-sub-registry-gc] INV-3 注册表卫生 ───────────────────────────
 SEEN_KEY_TEMPLATE = "bigqmt:quote_subs_seen:{account_id}"
 # [对抗复审 DEF-1 修复] 首见账本持久化在 Redis — 泵进程重启不再重置宽限起点。
-# 原实现把首见账本记在策略进程内存里, 宽限锚随进程死亡 ⇒ 现实重启节律下
+# 原实现把首见账本记在策略进程内存里, 宽限锚随进程死亡 => 现实重启节律下
 # reap 恒空转 (装置失效), 而 >72h 长活+单端升级时又一拍全池回收 (爆炸半径无界)。
 FIRSTSEEN_KEY_TEMPLATE = "bigqmt:quote_subs_firstseen:{account_id}"
 TOMBSTONE_KEY_TEMPLATE = "bigqmt:quote_subs_tombstone:{account_id}"
@@ -90,7 +90,7 @@ def coerce_seconds_to_ms(value, fallback_sec):
 
     数字/数字字符串均可; None/空串/非法/<=0 一律回退默认 — 修复原
     ``int(cfg * 1000)`` 对字符串配置做 str*1000 重复再 int() 的类型混淆
-    (ValueError 被 pump 外层宽捕获吞掉 ⇒ GC 每 60s print 后静默摆烂)。
+    (ValueError 被 pump 外层宽捕获吞掉 => GC 每 60s print 后静默摆烂)。
     """
     try:
         if value is None or str(value).strip() == "":
@@ -119,7 +119,7 @@ def reap_stale_subscriptions(redis_client, account_id, *, now_ms, keep_ttl_ms,
          首次观测距今 > grace_ms — 宽限期内/从未见过的新条目绝不误收;
          泵重启不重置宽限起点 (修复原首见账本进程内存态缺陷);
       2. 保活戳缺失 或 now-stamp > keep_ttl_ms — 戳由消费端 dispatch 成功后节流写,
-         消费端死亡 ⇒ 戳停更。
+         消费端死亡 => 戳停更。
 
     动作 (每笔): hdel 注册条目 + hdel 首见账本条目 (账本自身保持有界) +
     zadd tombstone(score=now_ms, member="seq|stock_code" 可溯源可恢复) +

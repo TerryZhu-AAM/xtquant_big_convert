@@ -15,15 +15,20 @@ def _float_or_none(value, default=None):
     return float(value)
 
 
-def _redis_accepts_protocol(redis_module):
-    """[BUG-20260826-redis35-protocol-kwarg] QMT 终端内嵌 Python 捆绑 redis-py 3.5.3,
-    `Redis.__init__` 无 `protocol` 形参 (4.x 才引入), 传了即 TypeError 且桥接启动即崩.
-    特性检测: 仅新版 redis-py 传 protocol; 旧版只会 RESP2, 不传恰好等价强制 RESP2."""
+def redis_supports_protocol_kw():
+    """redis-py 的 Redis.__init__ 从 5.0 起才有 protocol 参数；QMT 自带的
+    redis-py 3.5.3 不认，硬传直接 TypeError 崩掉（issue #71，PR #67 的回归）。
+    [BUG-20260826-redis35-protocol-kwarg 本地同族定谳合并] 特性检测: 仅新版
+    redis-py 传 protocol; 旧版只会 RESP2, 不传恰好等价强制 RESP2; C 实现取不
+    到签名等异常一律按不支持处理。"""
+    import inspect
+
     try:
-        params = inspect.signature(redis_module.Redis.__init__).parameters
-    except (TypeError, ValueError):  # C 实现等取不到签名 → 按不支持处理
+        import redis
+
+        return "protocol" in inspect.signature(redis.Redis.__init__).parameters
+    except Exception:
         return False
-    return "protocol" in params
 
 
 def build_redis_client(config=None):
@@ -58,8 +63,9 @@ def build_redis_client(config=None):
     print("[redis_common] build_redis_client host=%s port=%s db=%d" % (host, port, db))
     username = config.get("username") or os.environ.get("BIGQMT_REDIS_USERNAME") or None
     password = config.get("password") or os.environ.get("BIGQMT_REDIS_PASSWORD") or None
-    # redis-py 8.x 默认 RESP3，Redis 5.0 只支持 RESP2 -> 强制 protocol=2
-    # (旧版 redis-py 无此形参, 见 _redis_accepts_protocol)
+    # redis-py 8.x 默认 RESP3，Redis 5.0 只支持 RESP2 -> 强制 protocol=2；
+    # 但 QMT 自带的 redis-py 3.5.3 没有 protocol 参数（issue #71），按版本能力透传。
+    protocol = int(config.get("protocol") or os.environ.get("BIGQMT_REDIS_PROTOCOL") or 2)
     kwargs = dict(
         host=host,
         port=port,
@@ -70,8 +76,8 @@ def build_redis_client(config=None):
         socket_timeout=_float_or_none(config.get("socket_timeout", 1.5), 1.5),
         health_check_interval=int(config.get("health_check_interval", 30)),
     )
-    if _redis_accepts_protocol(redis):
-        kwargs["protocol"] = int(config.get("protocol") or os.environ.get("BIGQMT_REDIS_PROTOCOL") or 2)
+    if redis_supports_protocol_kw():
+        kwargs["protocol"] = protocol
     return redis.Redis(**kwargs)
 
 

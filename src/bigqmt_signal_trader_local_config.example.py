@@ -10,7 +10,26 @@ Do not commit the real file. It may contain account ids and Redis credentials.
 
 BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 
+# STOCK(股票) / CREDIT(信用两融) / FUTURE(期货) / STOCK_OPTION(股票期权) ...
+# 信用账户务必设为 CREDIT：按 STOCK 查询不会报错，get_trade_detail_data 会返回
+# 一行全 0 的资产，表现为「信用账户资产全是 0」而日志里毫无线索（issue #92）。
+# 也可以写在下面 BIGQMT_REDIS_CONFIG 的 "account_type" 里，两处都认；解析结果
+# 会在启动时打印，冲突也会指出来。
+BIGQMT_ACCOUNT_TYPE = "STOCK"
+
 BIGQMT_REDIS_CONFIG = {
+    # 这台机器上有没有 redis 可用。默认 True，仅对非 redis 传输生效。
+    #
+    # 设 False 时整个 redis 块不再下发给策略，于是委托身份库、异步下载任务、
+    # 全推快照缓存、exec 事件推送都不会去连 redis —— 一次都不试。用在券商 QMT
+    # 的 import 白名单不含 redis、或纯 zmq 部署本来就没装 redis 的场景
+    # （issue #145 / #147）。下面的 host/port 有默认值，所以不设这一项时
+    # 「配了 redis」和「什么都没写」是分辨不出来的。
+    #
+    # 代价：查询里的 strategy_name 回填失效（那份记录只存在 redis 里，见 #133）；
+    # 异步下载任务和全推快照缓存不可用（这两个在大 QMT 上本来就默认关闭）。
+    # 委托/成交回调不受影响 —— 它们会走 zmq 推送通道。
+    # "redis_enabled": False,
     "host": "127.0.0.1",
     "port": 6379,
     "db": 5,
@@ -18,6 +37,11 @@ BIGQMT_REDIS_CONFIG = {
     "password": "",
     # Keep order RPC disabled unless you explicitly want remote order/cancel.
     "rpc_allow_order_methods": False,
+    # 未指定 strategy_name 的委托带的 投资备注，默认 "bigqmt_rpc"。
+    # 注意这不是内部字段：QMT 把它显示在 委托 列表的「报单来源」列里
+    # （issue #154），任何看那个界面的人都能看到。设成自己的名字，或者设成
+    # "" 让该列留空 —— 和手动下单一样。单次调用传 strategy_name= 始终优先。
+    # "rpc_default_strategy_name": "",
     # Redis and ZMQ can both drain requests through QMT's official
     # run_time("adjust", ...) callback. This avoids GIL stalls in QMT's process.
     "rpc_process_in_listener": True,

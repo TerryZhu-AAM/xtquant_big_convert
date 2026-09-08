@@ -17,13 +17,16 @@ def get_market_data(field_list=[], stock_list=[], period="1d", start_time="", en
     return _compat.xtdata.get_market_data(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data)
 
 
-def get_market_data_ex(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True, chunk_size=None, timeout_seconds=None, use_formula=True):
+def get_market_data_ex(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True, chunk_size=None, timeout_seconds=None, use_formula=True, backfill_pre_close=True, resynth_ongoing_multiday=True):
     # [compat v0.2.6] 增 chunk_size (分段大小, issue #47 RPC timeout 共享问题)
     # + timeout_seconds (单批 RPC 超时), 与 BigQmtXtData.get_market_data_ex 同款签名.
     # ShimSignatureParityTest 全量锁.
     # [merge 2026-09-03] 上游 0.3.x 增 use_formula (订阅推送必须拿最新数据时关
     # FormulaServer 快照旁路), 同款签名随动。
-    return _compat.xtdata.get_market_data_ex(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data, chunk_size, timeout_seconds, use_formula)
+    # [fix R35-471ae97-01 2026-09-08] 上游 0.3.25/0.3.26 增 backfill_pre_close
+    # (#166/#222 preClose 自愈) + resynth_ongoing_multiday (#226 多日重建自愈),
+    # shim 同款签名随动 (默认值与 compat 一致 True/True), parity 锁恢复绿。
+    return _compat.xtdata.get_market_data_ex(field_list, stock_list, period, start_time, end_time, count, dividend_type, fill_data, chunk_size, timeout_seconds, use_formula, backfill_pre_close, resynth_ongoing_multiday)
 
 
 def get_local_data(field_list=[], stock_list=[], period="1d", start_time="", end_time="", count=-1, dividend_type="none", fill_data=True, data_dir=None):

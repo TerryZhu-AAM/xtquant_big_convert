@@ -658,6 +658,11 @@ _formula_stale_warned = {}
 _formula_stale_until = {"ts": 0.0}
 
 
+def _newest_bar_completes_session(newest):
+    """最新 bar 已到当日 15:00 收盘 ⇒ 当日会话数据终态完整 (非视图冻结)。"""
+    return newest.hour >= 15
+
+
 def _formula_bars_stale(data, params):
     """返回 (code, newest_dt, lag_seconds) 或 None。只检测，不告警。"""
     try:
@@ -682,7 +687,15 @@ def _formula_bars_stale(data, params):
             if newest is None:
                 continue
             lag = (now - newest).total_seconds()
-            if (newest.date() < today) or (lag > _FORMULA_STALE_WARN_LAG_SECONDS):
+            if newest.date() < today:
+                return (str(code), newest, lag)
+            # [SVA1-F2b 2026-09-08] 当日 15:00 收盘 bar 在帧 ⇒ 当日会话数据已
+            # 终态完整: 滞后只反映「已收盘」不反映「视图冻结」。旧 lag>30min
+            # 单腿把 15:31+ 盘后今日窗读 (15:30 daily 链分钟 ETL 等) 全数判
+            # 丢弃回落 RPC (= 订阅风暴路) — 每日风暴会在 F1+F2 之后仍借该腿
+            # 复活。盘后截断视图 (终端盘中崩溃 → 最新 bar 停在盘中) 当日不
+            # 完整, 仍被 lag 腿咬住, 安全语义不变。
+            if lag > _FORMULA_STALE_WARN_LAG_SECONDS and not _newest_bar_completes_session(newest):
                 return (str(code), newest, lag)
     except Exception:
         pass
@@ -714,6 +727,30 @@ def _warn_stale_formula_bars(data, params, hit=None):
 def _formula_stale_active():
     """冷却期内跳过公式直连（检测到滞后之后的一段时间）。"""
     return time.time() < _formula_stale_until.get("ts", 0.0)
+
+
+def _is_historical_market_data_query(params):
+    """纯历史窗读判定：end_time 明确早于今日 → True（其余一律按活窗保守处理）。
+
+    [SVA1 2026-09-08 subscribe-storm] _formula_bars_stale 的
+    「newest.date() < today」谓词对任何历史窗查询恒真（窗内最新 bar 必然
+    < 今天）→ FormulaServer 已成功直连返回的完整历史帧被整帧丢弃 + 120s
+    全局冷却 + 递归回落 RPC → QMT 引擎对 serve 缓存缺失票逐票 1m 订阅
+    （PythonCacheData count=2147483647 无逐出全历史物化）＝ 09-08 全市场
+    缝隙回填内存事故的快路失效根因（实弹 SVA1-C：688796.SH 完整 3374 行
+    被弃后回落 RPC 订阅）。历史窗对「盘中活数据冻结」天然免疫——滞后
+    检测只该管活窗。判定与 formula_server._stale_market_data 的
+    purely-historical 分支同构（window_end = end_time or today，
+    window_end < today → 历史）；end_time 空/不可解析＝活窗，守卫语义
+    原样保留。
+    """
+    try:
+        end_digits = _digits_only((params or {}).get("end_time") or "")[:8]
+        if len(end_digits) != 8:
+            return False
+        return end_digits < _dt.datetime.now().strftime("%Y%m%d")
+    except Exception:
+        return False
 
 
 def _qmt_stime_index(value):
@@ -1180,11 +1217,19 @@ class BigQmtRpcClient:
         # 盘中形成 bar 轮询）——FormulaServer 的快照可能滞后数小时（实测盘中
         # 11:30 后冻结），形成 bar 只能走 RPC 桥读 QMT 实时数据。
         router = self._formula_router() if use_formula else None
+        # [SVA1 2026-09-08] 纯历史窗读不吃滞后冷却：冷却由活窗滞后检出设置，
+        # 历史窗对活数据冻结免疫——mixed 进程里 ETL 类历史回补不该被同进程
+        # 盘中读的冷却连带降级回 RPC（RPC 路＝引擎逐票订阅放大器）。
+        _is_history = (
+            method == "get_market_data_ex"
+            and _is_historical_market_data_query(params or {})
+        )
         # 冷却期（公式数据刚被检出滞后）只对 get_market_data_ex 跳过直连——
         # 其他方法是静态参考数据，不受时间序列滞后影响，照常走快速路径。
         skip_formula = (
             router is not None
             and method == "get_market_data_ex"
+            and not _is_history
             and _formula_stale_active()
         )
         if router is not None and router.supports(method) and not skip_formula:
@@ -1192,10 +1237,12 @@ class BigQmtRpcClient:
 
             try:
                 result = _restore_jsonable(router.call(method, params or {}))
-                if method == "get_market_data_ex":
+                if method == "get_market_data_ex" and not _is_history:
                     # 直连快照可能滞后（实测冻结数小时）——滞后即告警、
                     # 本次调用自动回落 RPC 桥拿实时数据，并进入冷却期
                     # 让后续调用直接跳过直连（到期重新探测，自愈）。
+                    # [SVA1 2026-09-08] 纯历史窗读豁免本检测（谓词对历史窗
+                    # 恒真会把完整直连结果整帧丢弃 → 回落 RPC 逐票订阅）。
                     hit = _formula_bars_stale(result, params or {})
                     if hit is not None:
                         _warn_stale_formula_bars(result, params or {}, hit=hit)
@@ -1713,6 +1760,43 @@ def auto_sync_enabled():
     """Writing into a live trading terminal is opt-in, not a side effect of
     connecting."""
     return _bool_value(os.environ.get("BIGQMT_AUTO_SYNC"), False)
+
+
+def _qmt_client_ws_mb(proc_name: str = "XtItClient"):
+    """[fix 2026-09-07 qmt-mem-freeze] 读本机 QMT 客户端进程 WS (MB).
+
+    download_server_raw 批前内存闸的观测源. 消费形态: 桥接客户端与 QMT 终端
+    同机部署 (A/B 两机皆然), psutil 从进程表外测 XtItClient 工作集 — 2026-09-07
+    实测分钟 ETL 全市场下载把 XtItClient WS 推到 8.9GB / Commit 36GB, 16GB 共租
+    机整机颠簸假死 (当日 17:25 硬重启; 看门狗缺位 = 同步下载路唯一无上限资源).
+
+    不可观测一律返 None (闸自禁用, 修前行为): psutil 缺失 (QMT 内嵌 python /
+    精简 venv)、本机无该进程 (远程桥接形态)、进程表读取异常. 调用方绝不 raise.
+    """
+    try:
+        import psutil
+    except ImportError:
+        return None
+    try:
+        needle = (proc_name or "").lower()
+        if not needle:
+            return None
+        peak = None
+        for proc in psutil.process_iter(["name", "memory_info"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                if needle not in name:
+                    continue
+                mem = proc.info.get("memory_info")
+                rss = getattr(mem, "rss", 0) or 0
+                mb = int(rss / (1024 * 1024))
+                if peak is None or mb > peak:
+                    peak = mb
+            except Exception:
+                continue
+        return peak
+    except Exception:
+        return None
 
 
 class BigQmtXtData:
@@ -3520,6 +3604,49 @@ class BigQmtXtData:
         result["total_batches"] = total_batches
         t0 = time.time()
         consecutive_failures = 0
+        # [fix 2026-09-07 qmt-mem-freeze] 批前内存闸 (single choke point: 日线
+        # 预下载分段 + 分钟 ETL 全市场单调用两路同治). 旋钮调用时解析:
+        #   BIGQMT_DL_MEM_WATCHDOG=0    逃生舱 (默认开)
+        #   BIGQMT_DL_MEM_SOFT_MB=3500  WS 进入让渡带 (给原生下载器刷盘窗口)
+        #   BIGQMT_DL_MEM_HARD_MB=5000  让渡耗尽仍 ≥ → 拒发余批 (aborted=True)
+        #   BIGQMT_DL_MEM_FLUSH_WAIT_SEC=45  单批让渡窗上限
+        #   BIGQMT_DL_MEM_POLL_SEC=5    让渡轮询间隔
+        #   BIGQMT_DL_MEM_PROC=XtItClient  被观测进程名 (子串匹配)
+        # soft=0 语义: 不让渡, 纯 hard 帽 (hard 熔断独立于 soft 带判定,
+        # QMW1-01 2026-09-07 勘误并落地); hard=0: 只让渡不熔断; 两者皆 0 =
+        # 闸不咬 (等价逃生舱半开, 仅观测面).
+        # 预算交互: 让渡发生在批间, 可使总耗时越 max_total_seconds ≤
+        # flush_wait + poll + 末批尾巴 (inflight 2×timeout + RPC timeout,
+        # 默认 60s 口径 ≈ 180s; QMW1-02 2026-09-07 勘误, 旧文漏计尾巴)
+        # — 预算是软运维帽, 内存是硬资源帽, 冲突时内存优先. 2026-09-07 17:34
+        # 分钟 ETL 实测: XtItClient WS 1.26GB→8.9GB / Commit→36GB (~20min),
+        # 16GB 共租机整机假死 (当日 17:25 已硬重启一次) — 熔断把「静默死锁」
+        # 降维成「响亮的局部缺数」, caller 既有 get 兜底 + 幂等重跑续传接住.
+        _gate_on = os.environ.get("BIGQMT_DL_MEM_WATCHDOG", "1").strip() not in (
+            "0", "false", "False",
+        )
+
+        def _knob_float(name, default):
+            # [QMW1-05 2026-09-07] 垃圾 env 值回落默认 + 响亮警示, 不让整条
+            # download_server_raw 炸 ValueError (与 reader「调用方绝不 raise」
+            # 同向). unset→default / set 空→0.0 口径逐位保留修前行为.
+            raw = os.environ.get(name)
+            if raw is None:
+                raw = str(default)
+            try:
+                return float(raw or 0)
+            except ValueError:
+                print(
+                    "[bigqmt_compat] download_server_raw mem gate knob %s=%r "
+                    "非数值 — 回落默认 %s" % (name, raw, default)
+                )
+                return float(default)
+
+        _ws_soft = _knob_float("BIGQMT_DL_MEM_SOFT_MB", 3500)
+        _ws_hard = _knob_float("BIGQMT_DL_MEM_HARD_MB", 5000)
+        _flush_wait = _knob_float("BIGQMT_DL_MEM_FLUSH_WAIT_SEC", 45)
+        _poll_sec = max(0.5, _knob_float("BIGQMT_DL_MEM_POLL_SEC", 5))
+        _gate_proc = os.environ.get("BIGQMT_DL_MEM_PROC", "XtItClient").strip() or "XtItClient"
         for i in range(0, len(codes), step):
             if (time.time() - t0) > float(max_total_seconds or 600.0):
                 print(
@@ -3529,6 +3656,36 @@ class BigQmtXtData:
                 )
                 result["aborted"] = True
                 break
+            if _gate_on:
+                _ws = _qmt_client_ws_mb(_gate_proc)
+                if _ws is not None and _ws_soft > 0 and _ws >= _ws_soft:
+                    _flush_deadline = time.time() + _flush_wait
+                    while _ws >= _ws_soft and time.time() < _flush_deadline:
+                        print(
+                            "[bigqmt_compat] download_server_raw mem gate: %s WS %dMB "
+                            ">= soft %.0fMB — 让渡等待刷盘 (period=%s, batch %d/%d)"
+                            % (_gate_proc, _ws, _ws_soft, period,
+                               result["ok"] + result["fail"] + 1, total_batches)
+                        )
+                        time.sleep(_poll_sec)
+                        _ws_next = _qmt_client_ws_mb(_gate_proc)
+                        if _ws_next is None:
+                            _ws = None  # 进程中途消失: 不可观测 → 本批放行 (修前行为)
+                            break
+                        _ws = _ws_next
+                # [QMW1-01 2026-09-07] hard 熔断独立于 soft 带判定 (提出嵌套):
+                # soft=0 纯 hard 帽 (:2969 申报语义) 时同样生效; WS<soft 时
+                # WS<hard 恒假, soft>0 默认路径零行为变化 (锁 1-8 复绿为证)。
+                if _ws is not None and _ws_hard > 0 and _ws >= _ws_hard:
+                    print(
+                        "[bigqmt_compat] download_server_raw mem gate ABORT: %s WS %dMB "
+                        ">= hard %.0fMB 让渡 %.0fs 不回落 — 拒发余批 %d/%d, caller get 兜底 "
+                        "+ 幂等重跑续传 (2026-09-07 整机假死防线)"
+                        % (_gate_proc, _ws, _ws_hard, _flush_wait,
+                           result["ok"] + result["fail"] + 1, total_batches)
+                    )
+                    result["aborted"] = True
+                    break
             batch = codes[i : i + step]
             try:
                 self.client.call(

@@ -2606,6 +2606,66 @@ class BigQmtXtData:
         self._quote_callbacks.pop(seq, None)
         return 0
 
+    def registry_deactivate_orphans(self, needed_codes) -> dict:
+        """[R25-03] 订阅 hash 跨 boot 孤儿清扫 (物理 hdel, 与退订路径同语义).
+
+        背景 (2026-09-08 600354.SH 断流案横扫实测): 注册表 hash 是 Redis 持久态,
+        而 _code_to_seq 反查映射与 backend tracked 集都是内存态 (每次 boot 重建) —
+        服务重启后昨日/历史池的 seq 对 tracked-diff 退订与 unsubscribe_quote
+        code→seq 反查双双不可见, 泵按 hash 全量每 ~1s 轮询白跑 (实测 25 条 /
+        ~14 条孤儿: 000983.SZ 系 08-27 残留, 510300/159915/512760 系 A 机已冻结
+        ETF 腿, 另含 08-31 旧池票).
+
+        判定: 条目 stock_code ∉ needed_codes 且 seq 不在本 boot _code_to_seq
+        活跃值集 → 孤儿, 走 save_quote_subscription(active=False) 物理移除
+        (与 unsubscribe_quote 无 session 分支同语义). 本 boot 活跃 seq 无条件
+        保护 — needed 口径漂移时宁留活条目, 不误删正在推送的票 (fail-toward-keep).
+       畸形条目 (非 dict / 无 stock_code) 不动 — 泵侧本就跳过, 防洗掉唯一可解析态.
+
+        Returns: {"deactivated": [stock_code...], "errors": n} — 观测面, 单条
+        失败不中断 (剩余孤儿由下一轮 SCAN prune 重试).
+        """
+        account_id = str(self.client.account_id or "")
+        key = "bigqmt:quote_subscriptions:%s" % account_id
+        try:
+            redis_client = self.client._redis()
+            raw = redis_client.hgetall(key) or {}
+        except Exception as exc:
+            print("[bigqmt_compat] registry sweep hgetall failed: %s" % exc)
+            return {"deactivated": [], "errors": 1}
+        needed = set(needed_codes or ())
+        live_seqs = {str(s) for s in self._code_to_seq.values()}
+        deactivated: list = []
+        errors = 0
+        for seq_key, payload_raw in raw.items():
+            seq_str = seq_key.decode("utf-8") if isinstance(seq_key, (bytes, bytearray)) else str(seq_key)
+            try:
+                if isinstance(payload_raw, (bytes, bytearray)):
+                    payload_raw = payload_raw.decode("utf-8")
+                payload = json.loads(payload_raw)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("active") is False:
+                continue
+            code = payload.get("stock_code")
+            if not code:
+                continue
+            if code in needed or str(payload.get("seq") or seq_str) in live_seqs:
+                continue
+            try:
+                if self.client.save_quote_subscription(seq_str, payload, active=False):
+                    deactivated.append(code)
+                else:
+                    errors += 1
+                    print("[bigqmt_compat] registry sweep hdel verify failed seq=%s code=%s"
+                          % (seq_str, code))
+            except Exception as exc:
+                errors += 1
+                print("[bigqmt_compat] registry sweep %s (%s) failed: %s" % (seq_str, code, exc))
+        return {"deactivated": deactivated, "errors": errors}
+
     # [quote_events] single-stock subscribe_quote real-time push listener
     # (upstream 的 _quote_session 只管 whole_quote; backend 用 subscribe_quote 走这套).
     def _start_quote_listener(self):

@@ -143,6 +143,20 @@ _last_quote_bar_time = {}
 # interval_seconds 配置, 默认 30s ≈ dedup 静默期后端 staleness 容差(180s)的 1/6。
 _last_quote_heartbeat_at = {}
 _QUOTE_HEARTBEAT_INTERVAL_SEC = 30.0
+# [R25-02 2026-09-08] per-code 饥饿计数 + native SDK 兜底 (600354.SH 断流案根治
+# ①层, 治本于发生地): 批量 context_info.get_full_tick 可能对单票持续返缺失/非法
+# cell (09-08 实测: 600354 自 09:33:40 起策略句柄快照持续饿死, 同刻 native
+# xtdata SDK 模块路径同码新鲜 — 两入口物理独立), 原三处静默 continue 让该票
+# 从 stream 消失且零心跳帧无痕, 拖到次日 09:00 SCAN 重订才自愈。计数键=stock_code
+# (同码旧 seq 在 subscribe 时已清, 单码单活 seq), 推送成功即清零。
+# 饥饿≥_QUOTE_STARVE_FALLBACK_AFTER 拍 → 逐码走 native SDK 兜底回填;
+# ≥_QUOTE_STARVE_WARN_AT 拍 → WARNING 留痕 (此后每 _QUOTE_STARVE_WARN_EVERY 拍
+# 复告一次, ~1/min, 防刷屏); 双源都饿死 (停牌/无成交语义) 长期保持 WARNING 级,
+# 不升级 critical — 升级判定归 backend 活性看门狗 (R25-01, 有独立拉通道可交叉)。
+_quote_starve_counts = {}
+_QUOTE_STARVE_FALLBACK_AFTER = 3
+_QUOTE_STARVE_WARN_AT = 5
+_QUOTE_STARVE_WARN_EVERY = 60
 # [BUG-20260827-sub-registry-gc] INV-3 注册表卫生: 服务端回收节流戳。env
 # BIGQMT_QUOTE_SUB_GC=1 才启用 (默认关=零行为变更); 回收动作带 tombstone 审计,
 # 回收清单同步清孤儿内存键。[对抗复审 DEF-1 修复] 首见账本已持久化到 Redis
@@ -1346,6 +1360,61 @@ def _push_quote_updates(context_info, config):
     if not isinstance(tick_data, dict):
         return 0
 
+    # [R25-02] per-code 覆盖率守卫: 批量源单票饥饿 → native xtdata SDK 兜底回填.
+    # 判饥饿 = cell 非 dict / 价格字段缺失非法 / ≤0 (与下方 per-code 循环三处
+    # continue 同判据, 前置到这里才能在循环前回填). 兜底走 _load_native_xtdata
+    # (bin.x64 真 SDK, 数据中心路径, 与 context_info 策略句柄物理独立 — 09-08
+    # 实测后者对 600354 持续饿死时前者同码新鲜). 回填成功 tick_data[code] 被
+    # 覆写, 后续 per-code 循环按原逻辑去重/心跳/发布 — 零发布逻辑复制.
+    # 懒加载 + 全程 try/except: 兜底自身任何失败不拖垮泵 (同 pump 契约).
+    _starved = []
+    for _seq_v, _code_v in all_subs:
+        _cell = tick_data.get(_code_v)
+        _ok = False
+        if isinstance(_cell, dict):
+            try:
+                _ok = float(_cell.get("lastPrice") or _cell.get("close") or 0) > 0
+            except (TypeError, ValueError):
+                _ok = False
+        if _ok:
+            continue
+        _n = _quote_starve_counts.get(_code_v, 0) + 1
+        _quote_starve_counts[_code_v] = _n
+        _starved.append(_code_v)
+        if _n == _QUOTE_STARVE_WARN_AT or (
+            _n > _QUOTE_STARVE_WARN_AT and (_n - _QUOTE_STARVE_WARN_AT) % _QUOTE_STARVE_WARN_EVERY == 0
+        ):
+            print("[bigqmt_quote_events] per-code starve n=%d code=%s "
+                  "(批量源持续缺失/非法 cell, 兜底=%s)"
+                  % (_n, _code_v, "on" if _n >= _QUOTE_STARVE_FALLBACK_AFTER else "pending"))
+    if _starved:
+        _healed = []
+        if len(_starved) and max(
+            _quote_starve_counts.get(_c, 0) for _c in _starved
+        ) >= _QUOTE_STARVE_FALLBACK_AFTER:
+            try:
+                from bigqmt_signal_trader.adapters.market_bigqmt import (
+                    _load_native_xtdata,
+                )
+                _native = _load_native_xtdata()
+                if _native is not None:
+                    _nd = _native.get_full_tick(_starved) or {}
+                    for _code_v in _starved:
+                        _ncell = _nd.get(_code_v)
+                        if not isinstance(_ncell, dict):
+                            continue
+                        try:
+                            if float(_ncell.get("lastPrice") or _ncell.get("close") or 0) > 0:
+                                tick_data[_code_v] = _ncell
+                                _healed.append(_code_v)
+                        except (TypeError, ValueError):
+                            pass
+            except Exception as _fb_exc:
+                print("[bigqmt_quote_events] native fallback failed: %s" % _fb_exc)
+        if _healed:
+            print("[bigqmt_quote_events] native fallback healed: %s "
+                  "(批量源饥饿, 数据中心路径回填)" % _healed)
+
     pushed = 0
     for seq_val, stock_code in all_subs:
         try:
@@ -1359,6 +1428,9 @@ def _push_quote_updates(context_info, config):
                 continue
             if close_v <= 0:
                 continue
+            # [R25-02] 本拍该码 cell 可用 (批量源或 native 兜底) → 清饥饿计数
+            # (dedup 静默属合法形态, 不影响「泵在正常迭代」的判定).
+            _quote_starve_counts.pop(stock_code, None)
             bar_time = "tick_%.4f" % close_v
             if bar_time == _last_quote_bar_time.get(str(seq_val)):
                 # [BUG-20260827-quote-heartbeat-frame] 价格未变被去重合法跳过 ≠ 流死。

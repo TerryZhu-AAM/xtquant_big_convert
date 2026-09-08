@@ -535,7 +535,12 @@ class AsyncOrderSettlementTest(unittest.TestCase):
             passorder_func=lambda *args: submissions.append(args),
             get_trade_detail_data_func=query,
         )
-        redis_client, service = self._service(gateway)
+        # [merge 2026-09-08] 上游新测试原用默认 timeout=5.0 并断言首 drain 即兑付,
+        # 固化了 "查找异常=立即终态" 的上游语义; 本地 R4 (return bool(final)) 语义
+        # 更强: deadline 前查询异常按早失重试, deadline 才兑付(同样 ok/SUBMITTED/
+        # 无 sysid/不重发, 且额外防瞬态查询失败被误判)。timeout=0.0 使首 drain 即
+        # 到 deadline, 上游测试意图在 R4 语义下完整成立。
+        redis_client, service = self._service(gateway, timeout=0.0)
         self._submit(service)
         service.drain_pending()
 

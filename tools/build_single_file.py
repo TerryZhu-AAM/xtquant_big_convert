@@ -89,8 +89,20 @@ def main():
     template = TEMPLATE.replace("__EMBEDDED_SOURCES_BLOCK__", embedded)
 
     total = sum(len(v) for v in sources.values()) + sum(len(v) for v in extra.values())
-    with open(OUT_PATH, "w", encoding="utf-8", newline="\n") as f:
-        f.write(template)
+    # [fix R35-471ae97-02 2026-09-08] 与 build_no_redis_single_file_flat.py 同款
+    # 产物编码契约: 模板首行声明 #coding:gbk (QMT 平台硬性要求, 见
+    # docs/BIGQMT_INNER_PYTHON_API_REFERENCE.md:49), 产物必须 GBK 可解码 ——
+    # 修前 encoding="utf-8" 裸写产出「GBK 声明 + UTF-8 字节」错位产物, 能否被
+    # QMT 加载取决于字节序列侥幸是否构成合法 GBK (实测当前内容侥幸可解码);
+    # 源注释一旦出现非 GBK 字符 (∉/∘/⇒ 已实弹) 即静默产出 QMT 加载即崩的产物。
+    # 改为严格 GBK 编码, 失败降级 replace + WARNING 留痕, 与兄弟构建器同构。
+    with open(OUT_PATH, "wb") as f:
+        try:
+            payload = template.encode("gbk")
+        except UnicodeEncodeError as exc:
+            print("WARNING: artifact contains non-GBK char(s), replaced in output: %s" % exc)
+            payload = template.encode("gbk", errors="replace")
+        f.write(payload)
     print("WROTE %s" % OUT_PATH)
     print("embedded files: %d package + %d top-level" % (len(sources), len(extra)))
     print("embedded raw bytes: %d" % total)

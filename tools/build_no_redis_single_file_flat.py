@@ -216,12 +216,20 @@ def main():
     template = FLAT_TEMPLATE.replace("__MODULE_FUNCS_BLOCK__", funcs_block)
 
     total = sum(len(v) for v in sources.values()) + sum(len(v) for v in extra.values())
-    # [fix R35-471ae97-02 2026-09-08] 写出编码 gbk→utf-8: 源注释含非 GBK 字符
-    # (∉/∘/⇒ 均实弹崩过) 时 GBK 写出直接 UnicodeEncodeError, 构建管线在中文
-    # Windows 上不可用; 兄弟构建器 build_single_file.py 自初版即 utf-8, Python 3
-    # 源码默认编码本就是 utf-8, QMT 端解析无碍 (utf-8 产物已在生产验证)。
-    with open(OUT_PATH, "w", encoding="utf-8", newline="\n") as f:
-        f.write(template)
+    # [fix R35-471ae97-02 2026-09-08] 产物编码契约: QMT 平台要求入口脚本首行
+    # #coding:gbk 且按声明用 GBK 解码加载 (docs/BIGQMT_INNER_PYTHON_API_REFERENCE.md:49),
+    # 产物必须 GBK 可解码。写出两阶段: 先严格 GBK 编码, 源注释含非 GBK 字符
+    # (∉/∘/⇒ 均实弹出现) 时降级 replace 并 WARNING 留痕 —— 既不让构建直接崩
+    # (修前 encoding="gbk" 裸写形态, UnicodeEncodeError×3), 也不产出「构建成功但
+    # QMT 加载即 SyntaxError」的产物 (中途误改 utf-8 裸写形态, 字节级编译实测崩
+    # at byte 4408)。replace 只影响注释里的数学符号, 中文与代码零损。
+    with open(OUT_PATH, "wb") as f:
+        try:
+            payload = template.encode("gbk")
+        except UnicodeEncodeError as exc:
+            print("WARNING: artifact contains non-GBK char(s), replaced in output: %s" % exc)
+            payload = template.encode("gbk", errors="replace")
+        f.write(payload)
     print("WROTE %s" % OUT_PATH)
     print("embedded files: %d package + %d top-level" % (len(sources), len(extra)))
     print("embedded raw bytes: %d (flat real code, not string/base64)" % total)

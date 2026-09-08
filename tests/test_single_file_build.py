@@ -25,9 +25,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
 
 BUILDERS = {
-    "redis": ("build_single_file.py", "utf-8"),
-    # [fix R35-471ae97-02 2026-09-08] 读回编码随构建器写出编码同步 gbk→utf-8。
-    "no_redis_flat": ("build_no_redis_single_file_flat.py", "utf-8"),
+    # [fix R35-471ae97-02 2026-09-08] 读回编码=产物写出编码: 两构建器统一产出
+    # GBK 声明 + GBK 可解码产物 (QMT 平台契约), 读回同用 gbk。
+    "redis": ("build_single_file.py", "gbk"),
+    "no_redis_flat": ("build_no_redis_single_file_flat.py", "gbk"),
 }
 
 _built = {}
@@ -57,6 +58,17 @@ class BuildsSucceedTest(unittest.TestCase):
     def test_redis_build_compiles(self):
         path, source = build("redis")
         compile(source, path, "exec")
+
+    def test_artifacts_are_gbk_decodable_at_byte_level(self):
+        """[fix R35-471ae97-02] str 级 compile 不走文件首行的 coding 声明, 测不到
+        「声明 gbk + 非 GBK 字节」错位 —— 那种产物 QMT 按 #coding:gbk 声明加载时
+        直接 'gbk codec can't decode' (docs/BIGQMT_INNER_PYTHON_API_REFERENCE.md:49
+        平台硬性要求入口声明 gbk)。字节级 compile 走声明, 才锁得住声明/字节一致。"""
+        for kind in ("redis", "no_redis_flat"):
+            path, _source = build(kind)
+            with io.open(path, "rb") as stream:
+                raw = stream.read()
+            compile(raw, path, "exec")
 
     def test_no_redis_flat_build_compiles(self):
         """The one that wraps every module in a function body."""

@@ -9,7 +9,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "src"))
 
 from bigqmt_signal_trader.adapters.market_bigqmt import BigQmtMarketDataProvider
+from bigqmt_signal_trader.adapters.order_bigqmt import BigQmtOrderGateway
 from bigqmt_signal_trader.adapters.order_dryrun import DryRunOrderGateway
+from bigqmt_signal_trader.adapters.position_bigqmt import BigQmtPositionProvider
 from bigqmt_signal_trader.models import (
     AssetSnapshot, CancelResult, OrderRequest, OrderSnapshot, OrderSubmitResult,
     PositionSnapshot, TradeSnapshot,
@@ -296,7 +298,7 @@ class FalseyCancelGateway(DryRunOrderGateway):
         self.query_error = query_error
         self.lookups = 0
 
-    def cancel(self, order_ref):
+    def cancel(self, order_ref, account_id=None):
         self.cancelled.append(order_ref)
         return CancelResult(
             success=self.native_success,
@@ -519,6 +521,38 @@ class AsyncOrderSettlementTest(unittest.TestCase):
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:ord-1"])
         self.assertTrue(response["ok"])
         self.assertIn("not found in system", response["server_error"])
+
+    def test_native_lookup_error_keeps_submission_without_resubmitting(self):
+        submissions = []
+        queries = []
+
+        def query(*args):
+            queries.append(args)
+            raise RuntimeError("simulated native ORDER query failure")
+
+        gateway = BigQmtOrderGateway(
+            context_info=None,
+            passorder_func=lambda *args: submissions.append(args),
+            get_trade_detail_data_func=query,
+        )
+        redis_client, service = self._service(gateway)
+        self._submit(service)
+        service.drain_pending()
+
+        response_key = "bigqmt:rpc:resp:acct:ord-1"
+        self.assertIn(response_key, redis_client.kv)
+        response = json.loads(redis_client.kv[response_key])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertEqual(response["data"]["status"], "SUBMITTED")
+        self.assertIsNone(response["data"]["order_sys_id"])
+        self.assertEqual(response["data"]["message"], "passorder submitted")
+        self.assertEqual(response["server_error"], "")
+        self.assertEqual(service.pending_settlement_count(), 0)
+
+        service.drain_pending()
+        service.drain_pending()
+        self.assertEqual(len(submissions), 1)
+        self.assertEqual(queries, [("acct", "STOCK", "ORDER", "")])
 
     def test_settlement_error_does_not_leak_into_other_responses(self):
         """issue #43 again, by another route: settling happens long after the
@@ -943,6 +977,84 @@ class RedisRpcTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["data"]["600000.SH"]["available"], 800)
         self.assertEqual(redis_client.published[0][0], "bigqmt:rpc:resp:acct:req-1")
+
+    def test_native_query_failure_becomes_rpc_error(self):
+        cases = (
+            ("get_positions", "POSITION"), ("query_stock_positions", "POSITION"),
+            ("query_orders", "ORDER"), ("query_stock_orders", "ORDER"),
+            ("query_trades", "DEAL"), ("query_stock_trades", "DEAL"),
+            ("query_execution_snapshot", "ORDER"), ("query_execution_snapshot", "DEAL"),
+        )
+        for method, failed_type in cases:
+            with self.subTest(method=method, failed_type=failed_type):
+                calls = []
+
+                def query(account_id, account_type, detail_type, *args):
+                    self.assertEqual((account_id, account_type), ("acct", "STOCK"))
+                    calls.append(detail_type)
+                    if detail_type == failed_type:
+                        raise RuntimeError("simulated native %s query failure" % failed_type)
+                    return []
+
+                redis_client, service = _service()
+                service.handlers.position_provider = BigQmtPositionProvider(query)
+                service.handlers.order_gateway = BigQmtOrderGateway(
+                    context_info=None, get_trade_detail_data_func=query)
+                service.enqueue_payload({
+                    "request_id": method,
+                    "account_id": "acct",
+                    "method": method,
+                    "params": {},
+                })
+                self.assertEqual(service.drain_pending(), 1)
+                response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:" + method])
+                self.assertFalse(response["ok"])
+                self.assertIsNone(response["data"])
+                self.assertEqual(response["error"],
+                                 "RuntimeError: simulated native %s query failure" % failed_type)
+                expected_calls = (["ORDER", "DEAL"]
+                                  if method == "query_execution_snapshot" and failed_type == "DEAL"
+                                  else [failed_type])
+                self.assertEqual(calls, expected_calls)
+
+    def test_native_empty_queries_remain_successful_rpc_results(self):
+        cases = (
+            ("get_positions", ["POSITION"], {}),
+            ("query_stock_positions", ["POSITION"], {}),
+            ("query_orders", ["ORDER"], []), ("query_stock_orders", ["ORDER"], []),
+            ("query_trades", ["DEAL"], []), ("query_stock_trades", ["DEAL"], []),
+            ("query_execution_snapshot", ["ORDER", "DEAL"], None),
+        )
+        for method, expected_calls, empty_result in cases:
+            with self.subTest(method=method):
+                calls = []
+
+                def query(account_id, account_type, detail_type, *args):
+                    calls.append(detail_type)
+                    if detail_type not in ("POSITION", "ORDER", "DEAL"):
+                        raise ValueError("unsupported detail type: " + detail_type)
+                    return []
+
+                redis_client, service = _service()
+                service.handlers.position_provider = BigQmtPositionProvider(query)
+                service.handlers.order_gateway = BigQmtOrderGateway(
+                    context_info=None, get_trade_detail_data_func=query)
+                service.enqueue_payload({
+                    "request_id": method,
+                    "account_id": "acct",
+                    "method": method,
+                    "params": {},
+                })
+                self.assertEqual(service.drain_pending(), 1)
+                response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:" + method])
+                self.assertTrue(response["ok"], response["error"])
+                if method == "query_execution_snapshot":
+                    self.assertEqual(response["data"]["orders"], [])
+                    self.assertEqual(response["data"]["trades"], [])
+                else:
+                    self.assertEqual(response["data"], empty_result)
+                self.assertEqual(response["error"], "")
+                self.assertEqual(calls, expected_calls)
 
     def test_process_in_listener_handles_request_without_waiting_for_drain(self):
         redis_client, service = _service(process_in_listener=True)
@@ -1553,6 +1665,115 @@ class ProbeCapabilitiesTest(unittest.TestCase):
     def test_probe_is_read_only_and_in_whitelist(self):
         handlers = self._handlers()
         self.assertIn("probe_capabilities", handlers.allowed_methods)
+
+
+class BatchSettlementTest(unittest.TestCase):
+    """#181 顺带点名的隐患: 批量里的每一笔都往同一个结算单槽里塞。
+
+    _handle_submit_orders_batch 把 item 原样交给 _handle_submit_order, 而后者
+    的 wait_settlement 默认 True。_pending_settlement 是单槽, 于是被逐笔覆盖;
+    服务层每个请求只 take 一次, 拿到的永远是最后一笔。
+
+    后果不是丢单 (每一笔都提交出去了), 是三件别的事:
+
+    * 整批应答被推迟到那一笔结算完或超时才发出 —— 批量存在的理由就是一次
+      往返, 这等于把最贵的一笔的延迟加回来;
+    * 那一笔的诊断挂到整批的应答上 (server_error 说 "order not found in
+      system", 而它说的只是其中一笔);
+    * 它回填的 order_sys_id 谁也读不到 —— 批量结果 dict 在结算之前就已经从
+      result 上拷完了。
+
+    批量应答本来就是逐项的 (每项带 index / order_sys_id / user_order_id),
+    委托号照样从 order_callback 推送学得到, 所以这里不该等结算。
+    """
+
+    def _service(self, gateway, timeout=5.0):
+        redis_client = FakeRedis()
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True, order_settle_timeout_seconds=timeout,
+        )
+        return redis_client, handlers, RedisPubSubRpcService(
+            redis_client, handlers, account_id="acct")
+
+    def _batch_params(self, count=2):
+        return {"orders": [
+            {"account_id": "acct", "stock_code": "600000.SH", "order_type": 23,
+             "order_volume": 100, "price_type": 11, "price": 10.1,
+             "order_remark": "batch-item-%d" % index}
+            for index in range(count)
+        ]}
+
+    def test_the_batch_handler_leaves_no_settlement_behind(self):
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            order_gateway=LateLandingOrderGateway(never=True),
+            allow_order_methods=True,
+        )
+
+        results = handlers.handle("order_stock_batch", self._batch_params(3))
+
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(item["success"] for item in results))
+        self.assertIsNone(handlers.take_pending_settlement())
+
+    def test_a_batch_reply_is_not_parked_behind_one_item(self):
+        redis_client, _handlers, service = self._service(
+            LateLandingOrderGateway(never=True))
+        service.enqueue_payload({
+            "request_id": "bat-1", "account_id": "acct",
+            "method": "order_stock_batch", "params": self._batch_params(2),
+        })
+
+        service.drain_pending()
+
+        self.assertIn("bigqmt:rpc:resp:acct:bat-1", redis_client.kv)
+        self.assertEqual(service.pending_settlement_count(), 0)
+
+    def test_one_items_diagnostic_does_not_ride_the_whole_batch(self):
+        """A batch of two is not "the order was not found" (issue #152 wording).
+
+        With the deadline already passed, the parked settlement answers with
+        the 模拟-run-mode warning -- which names one stock, one price and one
+        volume, and would be attached to a reply covering every order in the
+        batch.
+        """
+        redis_client, _handlers, service = self._service(
+            LateLandingOrderGateway(never=True), timeout=0.0)
+        service.enqueue_payload({
+            "request_id": "bat-2", "account_id": "acct",
+            "method": "order_stock_batch", "params": self._batch_params(2),
+        })
+
+        service.drain_pending()
+
+        response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:bat-2"])
+        self.assertTrue(response["ok"], response.get("error"))
+        self.assertEqual(response.get("server_error", ""), "")
+        self.assertEqual(len(response["data"]), 2)
+
+    def test_a_single_order_still_waits_for_its_settlement(self):
+        """Negative control: the fix must not disarm the single-order path.
+
+        order_stock keeps parking its reply until the id lands (#44/#152) --
+        that is the whole settlement machinery, and only the batch path had no
+        way to use it.
+        """
+        redis_client, _handlers, service = self._service(
+            LateLandingOrderGateway(never=True))
+        service.enqueue_payload({
+            "request_id": "ord-9", "account_id": "acct", "method": "order_stock",
+            "params": {"stock_code": "600000.SH", "order_type": 23,
+                       "order_volume": 100, "price_type": 11, "price": 10.1,
+                       "order_remark": "ord-9"},
+        })
+
+        service.drain_pending()
+
+        self.assertNotIn("bigqmt:rpc:resp:acct:ord-9", redis_client.kv)
+        self.assertEqual(service.pending_settlement_count(), 1)
 
 
 if __name__ == "__main__":

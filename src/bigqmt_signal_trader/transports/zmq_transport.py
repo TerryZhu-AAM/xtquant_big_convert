@@ -22,6 +22,7 @@ using DEALER + ``poll`` (synchronous request/response fits the RPC model).
 import json
 import queue
 import threading
+import traceback
 import time
 import uuid
 
@@ -142,6 +143,18 @@ class ZmqTransport(RpcTransport):
         self._router = None
         self._router_thread = None
         self._actual_bind_address = None  # set after start_receiving()
+        self._reply_residency = {"count": 0, "sum_ms": 0.0, "max_ms": 0.0}
+        # Wake pipe: a reply produced on the adjust thread is queued, and the
+        # router thread only drains the queue at the top of its loop -- after a
+        # recv that blocks up to RCVTIMEO. Measured residency was 1149ms avg on
+        # a 1s RCVTIMEO, which is most of a 1500ms trade query (#104). Signalling
+        # here lets the loop come round at once instead of polling, so idle costs
+        # nothing -- the router thread shares the GIL with QMT's strategy thread
+        # and must not spin.
+        self._wake_endpoint = "inproc://bigqmt-wake-%d" % id(self)
+        self._wake_recv = None
+        self._wake_send = None
+        self._wake_lock = threading.Lock()
         self._pending_identities = {}  # request_id -> client identity bytes
         self._identity_lock = threading.Lock()
         self._response_queue = queue.Queue()
@@ -154,8 +167,18 @@ class ZmqTransport(RpcTransport):
         # Reported by the stall watchdog below; None when idle.
         self._in_flight = None
         self._stall_thread = None
-        # client state
-        self._dealer = None
+        # client state. One DEALER per calling thread (#186): a zmq socket is
+        # not thread-safe, and the single shared one had to be held for the
+        # whole send/poll/recv cycle -- so N threads took turns and concurrency
+        # bought nothing. Measured on the live terminal, 4 threads moved zmq
+        # from 2.4 to 2.7 requests/sec while redis, which has no such lock,
+        # went from 20.7 to 143.3.
+        #
+        # One socket per thread is zmq's own answer. Each gets its own random
+        # IDENTITY, so the server's ROUTER routes every reply back to the
+        # thread that asked. _client_lock now guards only the registry.
+        self._dealer_local = threading.local()
+        self._dealers = []          # [(thread, socket)] for shutdown + pruning
         self._client_lock = threading.Lock()
 
     # -- construction helper ----------------------------------------------
@@ -198,6 +221,43 @@ class ZmqTransport(RpcTransport):
         return self._zmq, self._ctx
 
     # -- server side ------------------------------------------------------
+    def _open_wake_pipe(self):
+        """PULL end for the router loop, PUSH end for whoever queues a reply.
+
+        inproc, so it never touches the network and needs no port. Failure is
+        non-fatal: without it the loop still drains on its own timeout, just
+        slowly -- which is exactly the behaviour this replaces.
+        """
+        try:
+            zmq, ctx = self._ensure_zmq()
+            recv = ctx.socket(zmq.PULL)
+            recv.setsockopt(zmq.LINGER, 0)
+            recv.bind(self._wake_endpoint)
+            self._wake_recv = recv
+        except Exception as exc:
+            print("%s zmq wake pipe unavailable: %s" % (self.print_prefix, exc))
+            self._wake_recv = None
+
+    def _signal_wake(self):
+        """Nudge the router loop. Called from the adjust thread.
+
+        zmq sockets are not thread safe, so the PUSH end is created once here
+        and used only under the lock; the PULL end belongs to the router thread.
+        """
+        if self._wake_recv is None:
+            return
+        try:
+            with self._wake_lock:
+                if self._wake_send is None:
+                    zmq, ctx = self._ensure_zmq()
+                    send = ctx.socket(zmq.PUSH)
+                    send.setsockopt(zmq.LINGER, 0)
+                    send.connect(self._wake_endpoint)
+                    self._wake_send = send
+                self._wake_send.send(b"1", self._zmq.DONTWAIT)
+        except Exception:
+            pass          # a missed nudge costs latency, never correctness
+
     def _bind_configured_address(self):
         """Bind exactly one configured address and reject duplicate servers."""
         zmq, ctx = self._ensure_zmq()
@@ -270,6 +330,7 @@ class ZmqTransport(RpcTransport):
                 % (self.print_prefix, bound)
             )
             return
+        self._open_wake_pipe()
         self._router_thread = threading.Thread(
             target=self._router_loop, name="bigqmt-zmq-rpc", daemon=True
         )
@@ -284,22 +345,89 @@ class ZmqTransport(RpcTransport):
         )
 
     def _router_loop(self):
+        """接收循环，出错自动重建 ROUTER 并继续（#240）。
+
+        原来这里是一层 try/finally：任何逃出内层 while 的异常都会走到 finally
+        关掉 socket、线程结束，**桥从此不再接收任何请求，也没有任何提示** ——
+        从客户端看和「服务端死了」一模一样，而 QMT 里的策略还好好地跑着，
+        adjust 照常打点。
+
+        redis 那两条循环早就是「异常 -> 退避 -> 重建连接」的形状；zmq 缺这一层。
+        现在补上：内层跑接收，外层负责重建。退避从 1 秒起、翻倍到 30 秒封顶 ——
+        端口被别的进程占着时不至于每秒刷屏。
+        """
+        backoff = 1.0
+        while self._running:
+            try:
+                self._router_session()
+                backoff = 1.0          # 正常退出（stop），不重连
+            except Exception:
+                if not self._running:
+                    break
+                print("%s zmq router failed, rebuilding in %.0fs:\n%s"
+                      % (self.print_prefix, backoff, traceback.format_exc()))
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30.0)
+                if not self._running:
+                    break
+                try:
+                    self._bind_configured_address()
+                except Exception:
+                    # 重建失败（端口还被占着）——下一轮继续退避重试，
+                    # 不能在这里放弃：放弃就回到了「线程静悄悄死掉」。
+                    print("%s zmq rebind failed, will retry" % self.print_prefix)
+                    continue
+                print("%s zmq router rebuilt bound=%s"
+                      % (self.print_prefix, self._actual_bind_address or self.bind_address))
+
+    def _router_session(self):
+        poller = None
+        if self._wake_recv is not None:
+            try:
+                poller = self._zmq.Poller()
+                poller.register(self._router, self._zmq.POLLIN)
+                poller.register(self._wake_recv, self._zmq.POLLIN)
+            except Exception:
+                poller = None
+        timeout_ms = int(self.recv_timeout_seconds * 1000)
         try:
             while self._running:
                 self._drain_response_queue()
-                request = self._receive_request()
-                if request is not None:
-                    self._deliver_request(request)
+                if poller is None:
+                    request = self._receive_request()
+                    if request is not None:
+                        self._deliver_request(request)
+                    continue
+                # Waiting on both ends means a reply queued by the adjust
+                # thread wakes this loop immediately instead of after RCVTIMEO.
+                try:
+                    events = dict(poller.poll(timeout=timeout_ms))
+                except Exception:
+                    events = {}
+                if self._wake_recv in events:
+                    try:
+                        while True:
+                            self._wake_recv.recv(self._zmq.DONTWAIT)
+                    except Exception:
+                        pass
+                if self._router in events:
+                    request = self._receive_request(flags=self._zmq.NOBLOCK)
+                    if request is not None:
+                        self._deliver_request(request)
         finally:
             # Close the ROUTER socket on the thread that owns it. On Windows,
             # closing a ZMQ socket from a different thread trips a signaler
             # assertion (abort); closing it here is safe because this thread
             # created and exclusively used it.
-            try:
-                self._router.close(linger=0)
-            except Exception:
-                pass
-            self._router = None
+            #
+            # 只在真正停机时关。重连路径上 _bind_configured_address 会建一个新的，
+            # 这里再关就把新 socket 关掉了 —— 那会让「重连成功」变成静默失效。
+            if not self._running:
+                try:
+                    self._router.close(linger=0)
+                except Exception:
+                    pass
+                self._router = None
 
     def _receive_request(self, flags=0):
         try:
@@ -380,9 +508,10 @@ class ZmqTransport(RpcTransport):
     def _drain_response_queue(self):
         while True:
             try:
-                identity, payload = self._response_queue.get_nowait()
+                identity, payload, queued_at = self._response_queue.get_nowait()
             except queue.Empty:
                 return
+            self._note_reply_residency((time.perf_counter() - queued_at) * 1000.0)
             try:
                 self._router.send_multipart([identity, payload])
                 self._sent_response_count += 1
@@ -391,11 +520,38 @@ class ZmqTransport(RpcTransport):
             except Exception as exc:
                 print("%s zmq send failed: %s" % (self.print_prefix, exc))
 
+    def _note_reply_residency(self, ms):
+        """How long a finished reply waited for the router loop to come round.
+
+        Measured because the round trip did not add up: ping handles in 0.1ms
+        and the adjust tick is 96ms, yet a request takes ~300ms end to end and
+        throughput sits at ~3.3/s no matter how many clients ask (#104).
+        """
+        stats = self._reply_residency
+        stats["count"] += 1
+        stats["sum_ms"] += ms
+        if ms > stats["max_ms"]:
+            stats["max_ms"] = ms
+
+    def reply_residency_stats(self):
+        stats = dict(self._reply_residency)
+        count = stats.get("count") or 0
+        stats["avg_ms"] = round(stats["sum_ms"] / count, 1) if count else 0.0
+        stats["max_ms"] = round(stats["max_ms"], 1)
+        stats["sum_ms"] = round(stats["sum_ms"], 1)
+        return stats
+
     def _queue_response(self, identity, payload, reason=""):
         # 出站堆积时让位排队而不是阻塞 router 线程：队列有上限，满时丢最旧
         # 并记日志（读类请求超时可重试，比全管道停摆好）。
         self._queued_response_count += 1
-        self._response_queue.put((identity, payload))
+        # Stamped so _drain_response_queue can report how long a reply sat
+        # here. The handler runs on the adjust thread, so every reply takes
+        # this path, and the queue is only drained at the top of the router
+        # loop -- after a recv_multipart that blocks up to RCVTIMEO. That
+        # residency, not the handler, is where the round trip goes (#104).
+        self._response_queue.put((identity, payload, time.perf_counter()))
+        self._signal_wake()
         if self._response_queue.qsize() > self._max_queued_responses:
             try:
                 self._response_queue.get_nowait()
@@ -474,46 +630,75 @@ class ZmqTransport(RpcTransport):
             return None
         return text or None
 
+    def _reap_dead_dealers(self):
+        """Close sockets whose owning thread has exited. Caller holds the lock.
+
+        Without this a caller that spawns a thread per request would leak one
+        socket -- and one TCP connection to the ROUTER -- per thread until
+        stop(). The owner is gone by definition here, so nobody can be inside
+        a send or recv on it; that is what makes closing it from this thread
+        safe, unlike the router socket (see stop()).
+        """
+        alive = []
+        for owner, sock in self._dealers:
+            if owner.is_alive():
+                alive.append((owner, sock))
+                continue
+            try:
+                sock.close(linger=0)
+            except Exception:
+                pass
+        self._dealers = alive
+
     def _ensure_dealer(self):
+        """This thread's DEALER, created on first use."""
+        sock = getattr(self._dealer_local, "sock", None)
+        if sock is not None:
+            return sock
         zmq, ctx = self._ensure_zmq()
-        if self._dealer is None:
-            address = self._resolve_connect_address()
-            sock = ctx.socket(zmq.DEALER)
-            # Unique identity so ROUTER can route replies back to us.
-            sock.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("utf-8")[:16])
-            sock.setsockopt(zmq.LINGER, self.client_linger_ms)
-            sock.connect(address)
-            self._dealer = sock
+        address = self._resolve_connect_address()
+        sock = ctx.socket(zmq.DEALER)
+        # Unique identity so ROUTER can route replies back to us.
+        sock.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("utf-8")[:16])
+        sock.setsockopt(zmq.LINGER, self.client_linger_ms)
+        sock.connect(address)
+        self._dealer_local.sock = sock
+        with self._client_lock:
+            self._reap_dead_dealers()
+            self._dealers.append((threading.current_thread(), sock))
             self.connect_address = address
-        return self._dealer
+        return sock
 
     def send_request(self, request, timeout_seconds, **_kwargs):
+        # No lock around the round trip: this socket belongs to this thread
+        # and no other thread touches it (#186).
         zmq = self._zmq or self._ensure_zmq()[0]
-        with self._client_lock:
-            dealer = self._ensure_dealer()
-            request = dict(request)
-            request.setdefault("request_id", uuid.uuid4().hex)
-            request_id = request["request_id"]
-            payload = encode_rpc_request_payload(request)
-            try:
-                dealer.send(payload.encode("utf-8"))
-            except Exception as exc:
-                raise TransportError("zmq send failed: %s" % exc)
-            deadline = time.time() + float(timeout_seconds)
-            poller = self._zmq.Poller()
-            poller.register(dealer, self._zmq.POLLIN)
-            while True:
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                events = dict(poller.poll(timeout=int(remaining * 1000)))
-                if dealer in events:
-                    frames = dealer.recv_multipart()
-                    raw = frames[-1]
-                    response = _loads(raw)
-                    if response.get("request_id") == request_id:
-                        return response
-            raise TransportTimeout("zmq rpc timeout: %s" % request.get("method"))
+        dealer = self._ensure_dealer()
+        request = dict(request)
+        request.setdefault("request_id", uuid.uuid4().hex)
+        request_id = request["request_id"]
+        payload = encode_rpc_request_payload(request)
+        try:
+            dealer.send(payload.encode("utf-8"))
+        except Exception as exc:
+            raise TransportError("zmq send failed: %s" % exc)
+        deadline = time.time() + float(timeout_seconds)
+        poller = zmq.Poller()
+        poller.register(dealer, zmq.POLLIN)
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            events = dict(poller.poll(timeout=int(remaining * 1000)))
+            if dealer in events:
+                frames = dealer.recv_multipart()
+                raw = frames[-1]
+                response = _loads(raw)
+                # A late reply to a request that already timed out lands here;
+                # skipping it keeps this thread's socket usable afterwards.
+                if response.get("request_id") == request_id:
+                    return response
+        raise TransportTimeout("zmq rpc timeout: %s" % request.get("method"))
 
     # -- lifecycle --------------------------------------------------------
     def stop(self):
@@ -536,10 +721,18 @@ class ZmqTransport(RpcTransport):
             self._clear_discovery()
             self._actual_bind_address = None
         with self._client_lock:
-            if self._dealer is not None:
+            for _owner, sock in self._dealers:
                 try:
-                    self._dealer.close(linger=self.client_linger_ms)
+                    sock.close(linger=self.client_linger_ms)
                 except Exception:
                     pass
-                self._dealer = None
+            self._dealers = []
+        # The caller's own thread-local still points at a closed socket; drop
+        # it so a send_request after stop() builds a fresh one rather than
+        # raising on a dead handle. Other threads' locals are unreachable from
+        # here -- their sockets are closed above, and _ensure_dealer would hand
+        # back the closed one, so those threads must not reuse the transport
+        # after stop(). That was true of the single shared dealer too.
+        if getattr(self._dealer_local, "sock", None) is not None:
+            self._dealer_local.sock = None
         # Do NOT terminate the shared context — other sockets/users may rely on it.

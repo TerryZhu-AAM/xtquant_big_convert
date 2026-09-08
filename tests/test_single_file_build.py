@@ -26,7 +26,8 @@ TOOLS = os.path.join(ROOT, "tools")
 
 BUILDERS = {
     "redis": ("build_single_file.py", "utf-8"),
-    "no_redis_flat": ("build_no_redis_single_file_flat.py", "gbk"),
+    # [fix R35-471ae97-02 2026-09-08] 读回编码随构建器写出编码同步 gbk→utf-8。
+    "no_redis_flat": ("build_no_redis_single_file_flat.py", "utf-8"),
 }
 
 _built = {}

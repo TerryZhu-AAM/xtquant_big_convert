@@ -216,7 +216,11 @@ def main():
     template = FLAT_TEMPLATE.replace("__MODULE_FUNCS_BLOCK__", funcs_block)
 
     total = sum(len(v) for v in sources.values()) + sum(len(v) for v in extra.values())
-    with open(OUT_PATH, "w", encoding="gbk", newline="\n") as f:
+    # [fix R35-471ae97-02 2026-09-08] 写出编码 gbk→utf-8: 源注释含非 GBK 字符
+    # (∉/∘/⇒ 均实弹崩过) 时 GBK 写出直接 UnicodeEncodeError, 构建管线在中文
+    # Windows 上不可用; 兄弟构建器 build_single_file.py 自初版即 utf-8, Python 3
+    # 源码默认编码本就是 utf-8, QMT 端解析无碍 (utf-8 产物已在生产验证)。
+    with open(OUT_PATH, "w", encoding="utf-8", newline="\n") as f:
         f.write(template)
     print("WROTE %s" % OUT_PATH)
     print("embedded files: %d package + %d top-level" % (len(sources), len(extra)))

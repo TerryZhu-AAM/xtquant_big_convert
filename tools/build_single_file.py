@@ -96,11 +96,26 @@ def main():
     # QMT 加载取决于字节序列侥幸是否构成合法 GBK (实测当前内容侥幸可解码);
     # 源注释一旦出现非 GBK 字符 (∉/∘/⇒ 已实弹) 即静默产出 QMT 加载即崩的产物。
     # 改为严格 GBK 编码, 失败降级 replace + WARNING 留痕, 与兄弟构建器同构。
+    # [fix R36-8c7893c-02 2026-09-08] 与 build_no_redis_single_file_flat.py 同款:
+    # 严格 encode 在首个非 GBK 字符处即抛, WARNING 只点名一个, 而 errors="replace"
+    # 静默替换全部 —— 逐字符重扫得完整清单 (字符+码点+次数) 再降级。清单用
+    # unicode_escape 转义打印: 原形态 "%s" % exc 把非 GBK 原字符写进 stdout,
+    # GBK 控制台下构建器自身可能因打印该字符而 UnicodeEncodeError 崩溃。
     with open(OUT_PATH, "wb") as f:
         try:
             payload = template.encode("gbk")
-        except UnicodeEncodeError as exc:
-            print("WARNING: artifact contains non-GBK char(s), replaced in output: %s" % exc)
+        except UnicodeEncodeError:
+            bad = {}
+            for ch in template:
+                try:
+                    ch.encode("gbk")
+                except UnicodeEncodeError:
+                    bad[ch] = bad.get(ch, 0) + 1
+            detail = ", ".join(
+                "%s(U+%04X)x%d" % (c.encode("unicode_escape").decode("ascii"), ord(c), n)
+                for c, n in sorted(bad.items())
+            )
+            print("WARNING: artifact contains non-GBK char(s), all replaced with '?' in output: %s" % detail)
             payload = template.encode("gbk", errors="replace")
         f.write(payload)
     print("WROTE %s" % OUT_PATH)

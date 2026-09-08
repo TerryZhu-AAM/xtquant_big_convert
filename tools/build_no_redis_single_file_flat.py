@@ -222,12 +222,32 @@ def main():
     # (∉/∘/⇒ 均实弹出现) 时降级 replace 并 WARNING 留痕 —— 既不让构建直接崩
     # (修前 encoding="gbk" 裸写形态, UnicodeEncodeError×3), 也不产出「构建成功但
     # QMT 加载即 SyntaxError」的产物 (中途误改 utf-8 裸写形态, 字节级编译实测崩
-    # at byte 4408)。replace 只影响注释里的数学符号, 中文与代码零损。
+    # at byte 4408)。
+    # [fix R36-8c7893c-01 2026-09-08 勘误] 下句原申报「replace 只影响注释里的
+    # 数学符号」失实: replace 替换全部非 GBK 字符且不限注释/字符串 —— 实测当前树
+    # 4 处命中 = 2 注释 (compat:692/1395) + 2 docstring (compat:662/3242, 字符串
+    # 字面量)。中文与代码零损的真正依据是 __doc__/doctest 运行时消费面全仓零命中,
+    # 不是「只碰注释」。
     with open(OUT_PATH, "wb") as f:
         try:
             payload = template.encode("gbk")
-        except UnicodeEncodeError as exc:
-            print("WARNING: artifact contains non-GBK char(s), replaced in output: %s" % exc)
+        except UnicodeEncodeError:
+            # [fix R36-8c7893c-02 2026-09-08] 严格 encode 在首个非 GBK 字符处即抛,
+            # WARNING 只点名一个, 而 errors="replace" 静默替换全部 —— 逐字符重扫
+            # 得完整清单 (字符+码点+次数) 再降级。清单用 unicode_escape 转义打印:
+            # 原形态 "%s" % exc 把非 GBK 原字符写进 stdout, GBK 控制台下构建器
+            # 自身可能因打印该字符而 UnicodeEncodeError 崩溃。
+            bad = {}
+            for ch in template:
+                try:
+                    ch.encode("gbk")
+                except UnicodeEncodeError:
+                    bad[ch] = bad.get(ch, 0) + 1
+            detail = ", ".join(
+                "%s(U+%04X)x%d" % (c.encode("unicode_escape").decode("ascii"), ord(c), n)
+                for c, n in sorted(bad.items())
+            )
+            print("WARNING: artifact contains non-GBK char(s), all replaced with '?' in output: %s" % detail)
             payload = template.encode("gbk", errors="replace")
         f.write(payload)
     print("WROTE %s" % OUT_PATH)
